@@ -12230,6 +12230,38 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
         }
     }
+    // the same prompt call on a Q8_0 cache (the 6-head route widens each key block to F16), per card (2 KV heads,
+    // contiguous K/V) and on one card in the cache's own layout (4 KV heads, keys interleaved across heads: permute 0213).
+    // 1,100 rows leave a 76-token chunk after the 1,024-token one; 12,288 keys end on a narrower key block
+    for (const auto & nh_perm : {std::pair<int64_t, std::array<int32_t, 4>>{2, {0, 1, 2, 3}}, {4, {0, 2, 1, 3}}}) {
+        for (int64_t kv : {4096, 12288, 16384}) {
+            for (int64_t nb : {256, 1024, 1100}) {
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, nh_perm.first, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32,
+                                                                GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, nh_perm.second));
+            }
+        }
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, nh_perm.first, {6, 1}, 16384, 2048, true, false, 0, 0, GGML_PREC_F32,
+                                                        GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, nh_perm.second));
+        // the route's small end on Q8_0: 17 tokens (one past the streaming kernel) up, from 256 keys up
+        for (int64_t kv : {256, 768, 4096}) {
+            for (int64_t nb : {17, 64, 200}) {
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, nh_perm.first, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32,
+                                                                GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, nh_perm.second));
+            }
+        }
+    }
+    // the verify, draft-step and decode call at depth (1 to 16 tokens, 4 KV heads x gqa 6, D 256): the streaming kernel on an F16
+    // and on a Q8_0 cache in the cache's own layout (permute 0213), on one KV stream and on two (the non-unified cache of
+    // --parallel 2); 9 to 16 tokens run as two 8-token blocks, 20,480 keys split across blocks and combine
+    for (ggml_type t : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+        for (int64_t ns : {1, 2}) {
+            for (int64_t kv : {4096, 20480}) {
+                for (int64_t nb : {1, 3, 8, 9, 16}) {
+                    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, ns}, kv, nb, true, false, 0, 0, GGML_PREC_F32, t, t, {0, 2, 1, 3}));
+                }
+            }
+        }
+    }
 
     // prefill-shaped cases with long KV (nb >= 32, kv >= 1024): covers the
     // XMX/GEMM-accelerated SYCL FA path which only activates for these shapes.
@@ -12624,6 +12656,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     for (int64_t kv : {16384, 65536, 98304}) {
         for (int64_t nb : {512, 2048, 16, 8}) {
             test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+        }
+    }
+    // the same on a Q8_0 cache in the cache's own layout (permute 0213), F16 beside it for the A/B
+    for (int64_t kv : {16384, 65536}) {
+        for (int64_t nb : {2048, 128, 17, 8, 4, 1}) {
+            for (ggml_type t : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, t, t, {0, 2, 1, 3}));
+            }
         }
     }
 

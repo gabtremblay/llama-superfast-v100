@@ -67,6 +67,7 @@
 #include "cutlass/numeric_conversion.h"
 
 #include "fattn-gqa6.cuh"
+#include "convert.cuh"
 
 #include <atomic>
 
@@ -74,6 +75,11 @@
 // LLAMA_FA_GQA6_MIN_ROWS / LLAMA_FA_GQA6_MIN_KV override them
 #define GQA6_MIN_ROWS 256
 #define GQA6_MIN_KV   4096
+// on a Q8_0 cache the route takes every prompt-sized call (more than the 16 tokens of the streaming verify kernel) from one
+// tile of keys on: the alternative is the mma kernel over an F16 copy of the whole cache, which the graph would also have to
+// reserve (ggml_cuda_flash_attn_ext_get_alloc_size); LLAMA_FA_GQA6_Q8_MIN_ROWS / LLAMA_FA_GQA6_Q8_MIN_KV override them
+#define GQA6_Q8_MIN_ROWS 17
+#define GQA6_Q8_MIN_KV   256
 
 // each call runs its tokens in chunks of at most this many (rows_pad, Nb and the workspace follow the chunk);
 // LLAMA_FA_GQA6_ROW_CHUNK overrides it, and 0 runs the whole call as one chunk
@@ -734,32 +740,51 @@ bool ggml_cuda_fattn_gqa6_applies(const ggml_tensor* dst) {
       ggml_get_op_params_i32(dst, 4) != 0) {
     return false;
   }
-  if (Q->type != GGML_TYPE_F32 || K->type != GGML_TYPE_F16 || V->type != GGML_TYPE_F16 || dst->type != GGML_TYPE_F32) {
+  // a Q8_0 cache: each key block's K and V are widened to F16 in a scratch buffer before its GEMMs (LLAMA_FA_GQA6_Q8=0: not taken)
+  static const bool q8_enabled = gqa6_env("LLAMA_FA_GQA6_Q8", 1) != 0;
+  const bool kv_f16 = K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16;
+  const bool kv_q8 = q8_enabled && K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q8_0;
+  if (Q->type != GGML_TYPE_F32 || !(kv_f16 || kv_q8) || dst->type != GGML_TYPE_F32) {
     return false;
   }
   if (Q->ne[0] != kHeadDim || K->ne[0] != kHeadDim || V->ne[0] != kHeadDim || K->ne[2] == 0 || Q->ne[2] != kQPerKV * K->ne[2] ||
       V->ne[2] != K->ne[2] || V->ne[1] != K->ne[1] || Q->ne[3] != 1 || K->ne[3] != 1 || V->ne[3] != 1) {
     return false;
   }
-  if (Q->ne[1] < min_rows || K->ne[1] < min_kv) {
+  static const int q8_min_rows = gqa6_env("LLAMA_FA_GQA6_Q8_MIN_ROWS", GQA6_Q8_MIN_ROWS);
+  static const int q8_min_kv = gqa6_env("LLAMA_FA_GQA6_Q8_MIN_KV", GQA6_Q8_MIN_KV);
+  if (Q->ne[1] < (kv_q8 ? q8_min_rows : min_rows) || K->ne[1] < (kv_q8 ? q8_min_kv : min_kv)) {
     return false;
   }
   // every key block is a whole number of 256-key tiles; the mask covers every key and token
   if (K->ne[1] % kTileKeys != 0 || mask->ne[0] < K->ne[1] || mask->ne[1] < Q->ne[1] || mask->ne[2] != 1 || mask->ne[3] != 1) {
     return false;
   }
-  // contiguous rows, and 16-byte loads of Q, K, V, the mask and dst
-  if (Q->nb[0] != sizeof(float) || K->nb[0] != sizeof(half) || V->nb[0] != sizeof(half) || mask->nb[0] != sizeof(half) ||
+  // contiguous rows, and 16-byte loads of Q, K, V, the mask and dst. A Q8_0 K/V is only read by the widening (the GEMMs
+  // load the F16 scratch), which needs whole blocks per row: nb[0] is the block size, every stride a whole number of blocks
+  const size_t kv_elt = kv_q8 ? ggml_type_size(GGML_TYPE_Q8_0) : sizeof(half);
+  if (Q->nb[0] != sizeof(float) || K->nb[0] != kv_elt || V->nb[0] != kv_elt || mask->nb[0] != sizeof(half) ||
       dst->nb[0] != sizeof(float)) {
     return false;
   }
-  if (!gqa6_aligned(Q) || !gqa6_aligned(K) || !gqa6_aligned(V) || !gqa6_aligned(mask) || !gqa6_aligned(dst)) {
+  if (!gqa6_aligned(Q) || !gqa6_aligned(mask) || !gqa6_aligned(dst)) {
     return false;
   }
-  static std::atomic<bool> warned{false};
-  if (!warned.exchange(true)) {
-    GGML_LOG_WARN("fattn: 6-head prompt attention (LLAMA_FA_GQA6): taken, rows %lld, keys %lld, min rows %d, min keys %d\n",
-                  (long long) Q->ne[1], (long long) K->ne[1], min_rows, min_kv);
+  if (kv_q8) {
+    for (const ggml_tensor* t : {K, V}) {
+      for (int i = 1; i < GGML_MAX_DIMS; ++i) {
+        if (t->nb[i] % kv_elt != 0) {
+          return false;
+        }
+      }
+    }
+  } else if (!gqa6_aligned(K) || !gqa6_aligned(V)) {
+    return false;
+  }
+  static std::atomic<bool> warned[2] = {false, false};
+  if (!warned[kv_q8].exchange(true)) {
+    GGML_LOG_WARN("fattn: 6-head prompt attention (LLAMA_FA_GQA6): taken, %s K/V, rows %lld, keys %lld, min rows %d, min keys %d\n",
+                  ggml_type_name(K->type), (long long) Q->ne[1], (long long) K->ne[1], min_rows, min_kv);
   }
   return true;
 }
@@ -798,6 +823,7 @@ void ggml_cuda_flash_attn_ext_gqa6(ggml_backend_cuda_context& ctx, ggml_tensor* 
   size_t q16_size = 0;
   size_t scores_size = 0;
   size_t stats_size = 0;
+  int block_n_max = 0;
   for (const int t : {chunk_tokens, n_tokens % chunk_tokens}) {
     if (t == 0) {
       continue;
@@ -807,11 +833,24 @@ void ggml_cuda_flash_attn_ext_gqa6(ggml_backend_cuda_context& ctx, ggml_tensor* 
     q16_size = std::max(q16_size, size_t(n_heads) * rows_pad * kHeadDim);
     scores_size = std::max(scores_size, size_t(n_heads) * rows_pad * block_n);
     stats_size = std::max(stats_size, 3 * size_t(n_heads) * (block_n / kTileKeys) * rows_pad + 4 * size_t(n_heads) * rows_pad);
+    block_n_max = std::max(block_n_max, block_n);
   }
   ggml_cuda_pool_alloc<half> q16(pool, q16_size);
   ggml_cuda_pool_alloc<half> scores(pool, scores_size);
   ggml_cuda_pool_alloc<float> stats(pool, stats_size);
   ggml_cuda_pool_alloc<float> out(pool, kSplitK * q16_size);
+
+  // a Q8_0 cache: one key block of K and of V widened to F16 as [head][key][256] (ld 256, head stride width*256), rewritten
+  // per block. At most heads x Nb x 256 halves each (4 KV heads, 10,752 keys: 21 MiB), instead of the whole cache
+  const bool kv_q8 = K->type == GGML_TYPE_Q8_0;
+  ggml_cuda_pool_alloc<half> k16(pool);
+  ggml_cuda_pool_alloc<half> v16(pool);
+  if (kv_q8) {
+    k16.alloc(size_t(n_heads) * block_n_max * kHeadDim);
+    v16.alloc(size_t(n_heads) * block_n_max * kHeadDim);
+  }
+  const to_fp16_nc_cuda_t q8_to_f16 = kv_q8 ? ggml_get_to_fp16_nc_cuda(GGML_TYPE_Q8_0) : nullptr;
+  const int64_t q8_bs = int64_t(ggml_type_size(GGML_TYPE_Q8_0));
 
   const int qk_smem = int(sizeof(QKSharedStorage));
   const int pv_smem = int(sizeof(PVSharedStorage));
@@ -822,8 +861,8 @@ void ggml_cuda_flash_attn_ext_gqa6(ggml_backend_cuda_context& ctx, ggml_tensor* 
     smem_set[id] = true;
   }
 
-  const int64_t k_row = K->nb[1] / sizeof(half);
-  const int64_t v_row = V->nb[1] / sizeof(half);
+  const int64_t k_row = kv_q8 ? kHeadDim : K->nb[1] / sizeof(half);
+  const int64_t v_row = kv_q8 ? kHeadDim : V->nb[1] / sizeof(half);
 
   for (int t0 = 0; t0 < n_tokens; t0 += chunk_tokens) {
     const int rows = std::min(chunk_tokens, n_tokens - t0) * kQPerKV;
@@ -886,8 +925,21 @@ void ggml_cuda_flash_attn_ext_gqa6(ggml_backend_cuda_context& ctx, ggml_tensor* 
       const int width = std::min(block_n, n_kv - begin);
       const int n_tiles = width / kTileKeys;
 
+      if (kv_q8) {
+        // widen this block's keys and values; the strides below are in Q8_0 blocks, the output is contiguous
+        q8_to_f16((const char*) K->data + begin * K->nb[1], k16.get(), kHeadDim, width, n_heads, 1, K->nb[1] / q8_bs,
+                  K->nb[2] / q8_bs, K->nb[3] / q8_bs, stream);
+        q8_to_f16((const char*) V->data + begin * V->nb[1], v16.get(), kHeadDim, width, n_heads, 1, V->nb[1] / q8_bs,
+                  V->nb[2] / q8_bs, V->nb[3] / q8_bs, stream);
+        CUDA_CHECK(cudaGetLastError());
+        qk.k = (Element*) k16.get();
+        qk.k_head_stride = int64_t(width) * kHeadDim;
+        pv.v_head_stride = int64_t(width) * kHeadDim;
+      } else {
+        qk.k = (Element*) ((char*) K->data + begin * K->nb[1]);
+      }
+
       qk.width = width;
-      qk.k = (Element*) ((char*) K->data + begin * K->nb[1]);
       qk.visitor.mask = mask_rows + begin;
       gqa6_qk_kernel<<<dim3(rows_pad / TBShape::kM, n_tiles, n_heads), QKDefault::kThreadCount, qk_smem, stream>>>(qk);
       CUDA_CHECK(cudaGetLastError());
@@ -900,7 +952,7 @@ void ggml_cuda_flash_attn_ext_gqa6(ggml_backend_cuda_context& ctx, ggml_tensor* 
       pv.width = width;
       pv.k_split = GGML_PAD(width / 2, TBShape::kK);
       pv.n_tiles = n_tiles;
-      pv.v = (Element*) ((char*) V->data + begin * V->nb[1]);
+      pv.v = kv_q8 ? (Element*) v16.get() : (Element*) ((char*) V->data + begin * V->nb[1]);
       pv.first = begin == 0;
       gqa6_pv_kernel<<<dim3(rows_pad / TBShape::kM, 1, n_heads * kSplitK), PVDefault::kThreadCount, pv_smem, stream>>>(pv);
       CUDA_CHECK(cudaGetLastError());

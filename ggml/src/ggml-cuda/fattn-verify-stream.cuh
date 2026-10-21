@@ -17,6 +17,11 @@
 // flash_attn_combine_results; with one split it writes the normalised result directly.
 // STUB = true is the ceiling probe: the same data path, both mma phases, the split and the combine, with the softmax replaced by
 // P = S/1024 (no max, no exp, no rescale, no sums).
+// KVQ8 = true reads a Q8_0 cache instead. Each lane loads the same 8 dims of a K or V row as on F16 (the row-coalesced K
+// load, the V fragment load), from its Q8_0 block: the block's d and 8 int8 codes, as five 2-byte loads (a 34-byte block is
+// only 2-byte aligned). The raw words wait in the same registers the F16 data would (kreg, vreg) and are widened to F16 where
+// those are consumed (the K tile's store to shared memory, the V fragment), so the loads stay one tile ahead and the mma
+// sequence is unchanged. The widening is exact up to one rounding of q*d to F16, as the dequantization to an F16 copy.
 
 #include <cuda_fp16.h>
 #include <cstdint>
@@ -66,6 +71,44 @@ static __device__ __forceinline__ float ex2(const float x) {
     return y;
 }
 
+// 8 dims of a row: on F16 one 16-byte load at p; on Q8_0 p is the Q8_0 block and off (0, 8, 16, 24) the first of the 8 codes,
+// returned raw as {codes 0-3, codes 4-7, d, 0}
+template <bool Q8>
+static __device__ __forceinline__ uint4 ld_row8(const char * p, const int off) {
+    if constexpr (Q8) {
+        const unsigned short * qs = (const unsigned short *)(p + 2 + off);
+        const uint32_t lo = (uint32_t) __ldg(qs + 0) | ((uint32_t) __ldg(qs + 1) << 16);
+        const uint32_t hi = (uint32_t) __ldg(qs + 2) | ((uint32_t) __ldg(qs + 3) << 16);
+        return make_uint4(lo, hi, (uint32_t) __ldg((const unsigned short *) p), 0);
+    } else {
+        (void) off;
+        return __ldg((const uint4 *) p);
+    }
+}
+
+// what ld_row8 returned, as 8 F16 values. Q8_0: each int8 code q is biased to an unsigned byte and placed under the F16
+// exponent of 1024 (0x64xx = 1024 + q + 128, exact), 1152 is taken off (exact: q itself) and the product with d is the one
+// rounding
+template <bool Q8>
+static __device__ __forceinline__ uint4 to_f16x8(const uint4 r) {
+    if constexpr (Q8) {
+        const half2  d    = __half2half2(__ushort_as_half((unsigned short) r.z));
+        const half2  bias = __half2half2(__ushort_as_half((unsigned short) 0x6480)); // 1152
+        const uint32_t a  = r.x ^ 0x80808080u;
+        const uint32_t b  = r.y ^ 0x80808080u;
+        uint32_t w[4] = { __byte_perm(a, 0x64646464u, 0x5140), __byte_perm(a, 0x64646464u, 0x7362),
+                          __byte_perm(b, 0x64646464u, 0x5140), __byte_perm(b, 0x64646464u, 0x7362) };
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const half2 h = __hmul2(__hsub2(*(const half2 *) &w[i], bias), d);
+            w[i] = *(const uint32_t *) &h;
+        }
+        return make_uint4(w[0], w[1], w[2], w[3]);
+    } else {
+        return r;
+    }
+}
+
 // G: GQA ratio (query heads per KV head); rows r < n_tok*G are real: token r/G, head kvh*G + r%G.
 // 9 to 16 tokens run as nhalf = 2 blocks per (KV head, split), blockIdx.x = half + nhalf*(kvh + n_kv_heads*split): block
 // half takes tokens 8*half .. 8*half + 7 (its own 8-row tile, exactly as an 8-token call of the same split computes them), and the
@@ -73,7 +116,7 @@ static __device__ __forceinline__ float ex2(const float x) {
 // BlockIdx.y is the KV stream (llama.cpp's non-unified cache: one stream per sequence, on ne[3] of Q, K, V and the mask); a block
 // reads only its own stream's Q, K, V and mask, at the same split as a call on that stream alone, and writes its tokens at stream*n_tok_all.
 // VAR & 31 = KP: of the 16 key rows per lane of a K tile, the PV group loads and stores the last KP (0 = the earlier kernel, all in the QK group)
-template <int G, bool STUB, int VAR = 0>
+template <int G, bool STUB, int VAR = 0, bool KVQ8 = false>
 __global__ void __launch_bounds__(NTH, 1) verify_stream(
         const float * __restrict__ Q, const char * __restrict__ K, const char * __restrict__ V, const char * __restrict__ mask,
         float * __restrict__ dst, float * __restrict__ parts, float2 * __restrict__ meta,
@@ -155,7 +198,12 @@ __global__ void __launch_bounds__(NTH, 1) verify_stream(
     const int ka = (w >> 1) & 1;   // key group of the QK phase (32 keys)
     const int rg = w & 1;          // row group of the QK phase (24 rows)
     const int keyA = 32*ka + l4 + 4*(qp & 1) + 8*hi + 16*(qp >> 1);   // this thread's key in the QK A fragment
-    const char * Vbase = V + kvh*nbv2 + (int64_t) l4*nbv1 + 2*(64*(w & 3) + 16*qp + 8*hi);
+    // a lane's 8 dims of a row: dims 8*lane.. of K, dims vd.. of V; on Q8_0 the byte offset of their block and the first code
+    const int vd   = 64*(w & 3) + 16*qp + 8*hi;
+    const int kofs = KVQ8 ? 34*(lane >> 2) : 16*lane;
+    const int kq   = 8*(lane & 3);
+    const int vq   = vd & 31;
+    const char * Vbase = V + kvh*nbv2 + (int64_t) l4*nbv1 + (KVQ8 ? 34*(vd >> 5) : 2*vd);
 
     // The two groups have separate loops (their register state is disjoint); both cross the same barriers nt + 2 times.
     if (isQK) {
@@ -167,16 +215,16 @@ __global__ void __launch_bounds__(NTH, 1) verify_stream(
             for (int j = 0; j < 4; ++j) { mrun[t][j] = -INFINITY; lrun[t][j] = 0.0f; }
         if (KQ > 0 && nt > 0) {
             {
-                const char * kp = Kbase + (int64_t)(it0*TK + w)*nbk1 + 16*lane;
+                const char * kp = Kbase + (int64_t)(it0*TK + w)*nbk1 + kofs;
 #pragma unroll
-                for (int rr = 0; rr < KQ; ++rr, kp += 4*nbk1) kreg[rr] = __ldg((const uint4 *) kp);
+                for (int rr = 0; rr < KQ; ++rr, kp += 4*nbk1) kreg[rr] = ld_row8<KVQ8>(kp, kq);
             }
 #pragma unroll
-            for (int rr = 0; rr < KQ; ++rr) *(uint4 *) &s.K[(4*rr + w)*KST + 8*lane] = kreg[rr];
+            for (int rr = 0; rr < KQ; ++rr) *(uint4 *) &s.K[(4*rr + w)*KST + 8*lane] = to_f16x8<KVQ8>(kreg[rr]);
             if (nt > 1) {
-                const char * kp = Kbase + (int64_t)((it0 + 1)*TK + w)*nbk1 + 16*lane;
+                const char * kp = Kbase + (int64_t)((it0 + 1)*TK + w)*nbk1 + kofs;
 #pragma unroll
-                for (int rr = 0; rr < KQ; ++rr, kp += 4*nbk1) kreg[rr] = __ldg((const uint4 *) kp);
+                for (int rr = 0; rr < KQ; ++rr, kp += 4*nbk1) kreg[rr] = ld_row8<KVQ8>(kp, kq);
             }
         }
         __syncthreads();
@@ -294,12 +342,12 @@ __global__ void __launch_bounds__(NTH, 1) verify_stream(
                 // the next K tile (loaded one iteration ago) into shared memory, then the one after it into registers
                 if (has_next) {
 #pragma unroll
-                    for (int rr = 0; rr < KQ; ++rr) *(uint4 *) &s.K[(4*rr + w)*KST + 8*lane] = kreg[rr];
+                    for (int rr = 0; rr < KQ; ++rr) *(uint4 *) &s.K[(4*rr + w)*KST + 8*lane] = to_f16x8<KVQ8>(kreg[rr]);
                     if (tid < 64) *(uint4 *) &s.M[b ^ 1][(tid >> 3)*MST + 8*(tid & 7)] = mnext;
                     if (KQ > 0 && j + 2 < nt) {
-                        const char * kp = Kbase + (int64_t)((it0 + j + 2)*TK + w)*nbk1 + 16*lane;
+                        const char * kp = Kbase + (int64_t)((it0 + j + 2)*TK + w)*nbk1 + kofs;
 #pragma unroll
-                        for (int rr = 0; rr < KQ; ++rr, kp += 4*nbk1) kreg[rr] = __ldg((const uint4 *) kp);
+                        for (int rr = 0; rr < KQ; ++rr, kp += 4*nbk1) kreg[rr] = ld_row8<KVQ8>(kp, kq);
                     }
                 }
             }
@@ -349,22 +397,22 @@ __global__ void __launch_bounds__(NTH, 1) verify_stream(
         if (nt > 0) {
             const char * vp = Vbase + (int64_t)(it0*TK)*nbv1;
 #pragma unroll
-            for (int q = 0; q < 16; ++q, vp += 4*nbv1) vreg[q] = __ldg((const uint4 *) vp);
+            for (int q = 0; q < 16; ++q, vp += 4*nbv1) vreg[q] = ld_row8<KVQ8>(vp, vq);
         }
         if constexpr (KP > 0) {   // the PV group owns the last KP rows of the K tile's load and its store to shared memory
             const int wk = w & 3;
             if (nt > 0) {
                 {
-                    const char * kp = Kbase + (int64_t)(it0*TK + wk + 4*KQ)*nbk1 + 16*lane;
+                    const char * kp = Kbase + (int64_t)(it0*TK + wk + 4*KQ)*nbk1 + kofs;
 #pragma unroll
-                    for (int rr = 0; rr < KP; ++rr, kp += 4*nbk1) kreg[rr] = __ldg((const uint4 *) kp);
+                    for (int rr = 0; rr < KP; ++rr, kp += 4*nbk1) kreg[rr] = ld_row8<KVQ8>(kp, kq);
                 }
 #pragma unroll
-                for (int rr = 0; rr < KP; ++rr) *(uint4 *) &s.K[(4*(KQ + rr) + wk)*KST + 8*lane] = kreg[rr];
+                for (int rr = 0; rr < KP; ++rr) *(uint4 *) &s.K[(4*(KQ + rr) + wk)*KST + 8*lane] = to_f16x8<KVQ8>(kreg[rr]);
                 if (nt > 1) {
-                    const char * kp = Kbase + (int64_t)((it0 + 1)*TK + wk + 4*KQ)*nbk1 + 16*lane;
+                    const char * kp = Kbase + (int64_t)((it0 + 1)*TK + wk + 4*KQ)*nbk1 + kofs;
 #pragma unroll
-                    for (int rr = 0; rr < KP; ++rr, kp += 4*nbk1) kreg[rr] = __ldg((const uint4 *) kp);
+                    for (int rr = 0; rr < KP; ++rr, kp += 4*nbk1) kreg[rr] = ld_row8<KVQ8>(kp, kq);
                 }
             }
         }
@@ -394,10 +442,10 @@ __global__ void __launch_bounds__(NTH, 1) verify_stream(
 #ifndef FVS_SKIP_PV
 #pragma unroll
                 for (int c = 0; c < TK/8; ++c) {
-                    const uint4 v0 = vreg[2*c], v1 = vreg[2*c + 1];
+                    const uint4 v0 = to_f16x8<KVQ8>(vreg[2*c]), v1 = to_f16x8<KVQ8>(vreg[2*c + 1]);
                     if (has_next) {
-                        vreg[2*c]     = __ldg((const uint4 *) vp);
-                        vreg[2*c + 1] = __ldg((const uint4 *)(vp + 4*nbv1));
+                        vreg[2*c]     = ld_row8<KVQ8>(vp, vq);
+                        vreg[2*c + 1] = ld_row8<KVQ8>(vp + 4*nbv1, vq);
                     }
                     vp += 8*nbv1;
 #pragma unroll
@@ -416,11 +464,11 @@ __global__ void __launch_bounds__(NTH, 1) verify_stream(
                     const int wk = w & 3;
                     asm volatile("bar.sync 2, 256;" ::: "memory");   // every QK warp is done reading the K tile
 #pragma unroll
-                    for (int rr = 0; rr < KP; ++rr) *(uint4 *) &s.K[(4*(KQ + rr) + wk)*KST + 8*lane] = kreg[rr];
+                    for (int rr = 0; rr < KP; ++rr) *(uint4 *) &s.K[(4*(KQ + rr) + wk)*KST + 8*lane] = to_f16x8<KVQ8>(kreg[rr]);
                     if (j + 2 < nt) {
-                        const char * kp = Kbase + (int64_t)((it0 + j + 2)*TK + wk + 4*KQ)*nbk1 + 16*lane;
+                        const char * kp = Kbase + (int64_t)((it0 + j + 2)*TK + wk + 4*KQ)*nbk1 + kofs;
 #pragma unroll
-                        for (int rr = 0; rr < KP; ++rr, kp += 4*nbk1) kreg[rr] = __ldg((const uint4 *) kp);
+                        for (int rr = 0; rr < KP; ++rr, kp += 4*nbk1) kreg[rr] = ld_row8<KVQ8>(kp, kq);
                     }
                 }
             }

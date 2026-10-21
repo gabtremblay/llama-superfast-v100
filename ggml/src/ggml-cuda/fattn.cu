@@ -708,6 +708,11 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 
     if (volta_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
+        // a call over a Q8_0 cache that the streaming kernel takes (1 to 16 tokens at depth, fattn-verify-stream.cu) goes to
+        // the mma case, whose dispatch runs that kernel first; the tile and vec routes would widen the whole cache to an F16 copy
+        if (ggml_is_quantized(K->type) && ggml_cuda_fattn_verify_stream_applies(dst, device)) {
+            return BEST_FATTN_KERNEL_MMA_F16;
+        }
         // the one-row call (the drafter's seven draft steps per round) on an f16 or bf16 cache of at least
         // LLAMA_FATTN_ONE_ROW_MMA keys (default 4096, -1: never) goes to the mma kernel, which reads each KV head once per group
         // (the vec kernel reads it once per query head). The target's own one-row calls take the same route.
@@ -782,6 +787,13 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
     GGML_ASSERT(K != nullptr);
     GGML_ASSERT(V != nullptr);
+
+    // the streaming kernel reads a Q8_0 cache in place and the 6-head prompt route widens it a key block at a time into its
+    // own scratch (fattn-gqa6.cu, taken on Volta only): neither needs the F16 copy of the whole cache
+    if (ggml_is_quantized(K->type) && (ggml_cuda_fattn_verify_stream_applies(dst, device) ||
+            (ggml_cuda_info().devices[device].cc == GGML_CUDA_CC_VOLTA && ggml_cuda_fattn_gqa6_applies(dst)))) {
+        return ggml_nbytes(dst);
+    }
 
     const best_fattn_kernel kernel = ggml_cuda_get_best_fattn_kernel(device, dst);
 

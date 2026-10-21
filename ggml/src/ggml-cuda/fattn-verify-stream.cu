@@ -7,7 +7,12 @@
 // (default 4096; -1 or 0: off, the mma routes are then used). And 9 to 16 tokens (two slots'
 // verify), as pairs of 8-token blocks over the same K/V stream (LLAMA_FATTN_VERIFY_STREAM_W16=0: 1 to 8 only, as before). And over
 // several KV streams (the non-unified cache, one per sequence: ne[3] of Q, K, V and the mask), each block on its own stream
-// (LLAMA_FATTN_VERIFY_STREAM_NS=0: one stream only, as before).
+// (LLAMA_FATTN_VERIFY_STREAM_NS=0: one stream only, as before). And over a Q8_0 cache (K and V both Q8_0, read in place and
+// widened to F16 in registers; LLAMA_FATTN_VERIFY_STREAM_Q8=0: not taken, the generic kernels then read an F16 copy).
+static bool fvs_q8() {
+    static const bool q8 = [] { const char * e = getenv("LLAMA_FATTN_VERIFY_STREAM_Q8"); return e == nullptr || atoi(e) != 0; }();
+    return q8;
+}
 static int fvs_min_keys() {
     static const int min_keys = [] { const char * e = getenv("LLAMA_FATTN_VERIFY_STREAM"); return e ? atoi(e) : 4096; }();
     return min_keys;
@@ -49,7 +54,9 @@ bool ggml_cuda_fattn_verify_stream_applies(const ggml_tensor * dst, int device) 
     if (max_bias != 0.0f || logit_softcap != 0.0f || sinks != nullptr || ggml_get_op_params_i32(dst, 4) != 0) {
         return false;
     }
-    if (Q->type != GGML_TYPE_F32 || K->type != GGML_TYPE_F16 || V->type != GGML_TYPE_F16 || !mask || mask->type != GGML_TYPE_F16) {
+    const bool kv_q8 = fvs_q8() && K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q8_0;
+    if (Q->type != GGML_TYPE_F32 || !((K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16) || kv_q8) || !mask ||
+            mask->type != GGML_TYPE_F16) {
         return false;
     }
     const int max_tok = fvs_max_tok();
@@ -64,12 +71,15 @@ bool ggml_cuda_fattn_verify_stream_applies(const ggml_tensor * dst, int device) 
             mask->ne[3] != ns) {
         return false;
     }
+    // 16-byte loads of Q, the mask and an F16 K/V; a Q8_0 K/V is read in 2-byte words, from whole blocks
     for (const ggml_tensor * t : {Q, K, V, mask}) {
-        if ((uintptr_t) t->data % 16 != 0 || t->nb[1] % 16 != 0 || t->nb[2] % 16 != 0 || t->nb[3] % 16 != 0) {
+        const size_t align = kv_q8 && (t == K || t == V) ? 2 : 16;
+        if ((uintptr_t) t->data % align != 0 || t->nb[1] % align != 0 || t->nb[2] % align != 0 || t->nb[3] % align != 0) {
             return false;
         }
     }
-    return Q->nb[0] == 4 && K->nb[0] == 2 && V->nb[0] == 2;
+    const size_t kv_elt = kv_q8 ? ggml_type_size(GGML_TYPE_Q8_0) : sizeof(half);
+    return Q->nb[0] == 4 && K->nb[0] == kv_elt && V->nb[0] == kv_elt;
 }
 
 void ggml_cuda_flash_attn_ext_verify_stream(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -87,9 +97,11 @@ void ggml_cuda_flash_attn_ext_verify_stream(ggml_backend_cuda_context & ctx, ggm
     constexpr size_t nbytes_shared = sizeof(fvs::smem_t);
     // the shared-memory limit is a per-device attribute (the macro keeps one flag per device), so it is raised on every
     // device that launches the kernel, not once inside the static below (the second card of --split-mode tensor failed the launch)
-    CUDA_SET_SHARED_MEMORY_LIMIT((fvs::verify_stream<6, false>),    nbytes_shared);
-    CUDA_SET_SHARED_MEMORY_LIMIT((fvs::verify_stream<6, false, 8>), nbytes_shared);
-    CUDA_SET_SHARED_MEMORY_LIMIT((fvs::verify_stream<6, true>),     nbytes_shared);
+    CUDA_SET_SHARED_MEMORY_LIMIT((fvs::verify_stream<6, false>),          nbytes_shared);
+    CUDA_SET_SHARED_MEMORY_LIMIT((fvs::verify_stream<6, false, 8>),       nbytes_shared);
+    CUDA_SET_SHARED_MEMORY_LIMIT((fvs::verify_stream<6, true>),           nbytes_shared);
+    CUDA_SET_SHARED_MEMORY_LIMIT((fvs::verify_stream<6, false, 0, true>), nbytes_shared);
+    CUDA_SET_SHARED_MEMORY_LIMIT((fvs::verify_stream<6, false, 8, true>), nbytes_shared);
     static int occ = [] {
         int o = 0;
         CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&o, kp8 ? fvs::verify_stream<6, false, 8> : fvs::verify_stream<6, false>, fvs::NTH, nbytes_shared));
@@ -124,7 +136,10 @@ void ggml_cuda_flash_attn_ext_verify_stream(ggml_backend_cuda_context & ctx, ggm
     }
 
     static const bool stub = [] { const char * e = getenv("LLAMA_FATTN_VERIFY_STREAM_STUB"); return e && atoi(e) != 0; }(); // ceiling probe, wrong output
-    (stub ? fvs::verify_stream<6, true> : kp8 ? fvs::verify_stream<6, false, 8> : fvs::verify_stream<6, false>)<<<dim3(nsplit*nkvh*nhalf, n_strm, 1), fvs::NTH, nbytes_shared, stream>>>(
+    // a Q8_0 cache has no stub variant: the probe is for the F16 data path
+    const bool kv_q8 = K->type == GGML_TYPE_Q8_0;
+    (kv_q8 ? (kp8 ? fvs::verify_stream<6, false, 8, true> : fvs::verify_stream<6, false, 0, true>) :
+     stub  ? fvs::verify_stream<6, true> : kp8 ? fvs::verify_stream<6, false, 8> : fvs::verify_stream<6, false>)<<<dim3(nsplit*nkvh*nhalf, n_strm, 1), fvs::NTH, nbytes_shared, stream>>>(
         (const float *) Q->data, (const char *) K->data, (const char *) V->data, (const char *) mask->data,
         (float *) dst->data, parts.ptr, meta.ptr, n_tok, n_head, nkvh,
         Q->nb[1], Q->nb[2], K->nb[1], K->nb[2], V->nb[1], V->nb[2], mask->nb[1], n_kv, kv_count, nsplit, scale*1.4426950408889634f, nhalf,
