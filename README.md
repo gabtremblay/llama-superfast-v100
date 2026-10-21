@@ -86,8 +86,21 @@ All of it is on the `q8-attention` branch, in four commits on top of upstream `4
 | Decode, 400 tokens, three prompts | 88 / 90 / 104 tok/s | 88 / 91 / 106 tok/s |
 | Context | 2 × 98,304 | 2 × 106,496 |
 
-The "upstream route" column is the same build with this fork's prefill and GPU-residency changes switched off. BetterBench
-results for the full configuration are in progress.
+The "upstream route" column is the same build with this fork's prefill and GPU-residency changes switched off.
+
+**BetterBench** (two slots, DFlash2 unless noted, q8_0 KV; vLLM is the same card's earlier vLLM server, for reference):
+
+| Run | Combined decode | Update p99 | Low 1% ITL | TTFT p50 | Aggregate @8 | Prefill @64k |
+|---|---|---|---|---|---|---|
+| vLLM | 49.0 tok/s | 74.1 ms | — | 256 ms | 138.0 tok/s | 772 tok/s |
+| MTP, 2 × 118,784 (`5c15ec5`) | 91.1 tok/s | 49.5 ms | 19.6 tok/s | 862 ms | 106.8 tok/s | 755 tok/s |
+| DFlash2, 2 × 98,304 (`5c15ec5`) | 105.7 tok/s | 46.8 ms | 20.6 tok/s | 874 ms | 85.6 tok/s | 771 tok/s |
+| **DFlash2, 2 × 106,496 (`64107c5`)** | **109.5 tok/s** | 48.9 ms | 19.5 tok/s | **324 ms** | 92.6 tok/s | **836 tok/s** |
+| DFlash2, unified pool of 212,992 (`64107c5`) | 109.7 tok/s | 45.8 ms | 21.2 tok/s | 317 ms | 92.6 tok/s | 531 tok/s |
+
+With `--kv-unified`, either slot can use most of the shared pool: one slot took a 157k-token prompt while the other still
+answered a side request. Decode and latency match the split cache, but long prefills are about a third slower. Pick
+unified when one conversation needs more than half the context; pick the split cache when long prompts dominate.
 
 `--cache-ram 0` turns off the host prompt cache. Saving a slot's state to host memory costs about 220 ms over this link
 each time a slot switches conversations. With one user and pinned slots (`id_slot` in the request), the cache brings
