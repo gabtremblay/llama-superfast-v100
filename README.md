@@ -27,7 +27,7 @@ All of it is on the `q8-attention` branch, in four commits on top of upstream `4
   - Allocations no longer reserve the f16 copy for those routes.
 - Context: our server went from two slots of 73,728 tokens (f16 cache, MTP draft) to two slots of 122,880 (`q8_0`,
   DFlash2 draft, with the VRAM change at the end of section 3). 2 × 131,072 also passes our fill test (both slots full
-  at once, then generation), with about 870 MiB to spare.
+  at once, then generation), with about 600 MiB to spare.
 - Tests: `q8_0` cases for both kernels in `test-backend-ops`, including the shapes the 27B uses.
 - Switches: `LLAMA_FA_GQA6_Q8=0` and `LLAMA_FATTN_VERIFY_STREAM_Q8=0` fall back to the generic kernels.
   `LLAMA_FATTN_VERIFY_STREAM_Q8_KP` and `LLAMA_FATTN_VERIFY_STREAM_Q8_W` tune the verify kernel.
