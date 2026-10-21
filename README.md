@@ -1,3 +1,105 @@
+# llama-superfast-v100-q8-inscora
+
+Inscora's fork of [bitexploder/llama-superfast-v100](https://github.com/bitexploder/llama-superfast-v100). It adds an
+8-bit (`q8_0`) KV cache that keeps the upstream fork's attention speed, so one 32 GB V100 holds about two thirds more
+context. It also makes prompt processing faster and keeps it on the GPU.
+
+We serve Qwen3.8-27B (`UD-Q4_K_XL`) on **one** Tesla V100 PCIe 32 GB behind an eGPU dock (PCIe Gen3 x4, about 3.3 GB/s).
+The draft model is DFlash2. The server runs two slots: one user, so an agent harness can send a side request in parallel
+with the main thinking thread. Every change below targets that setup. On a slow host link, anything that crosses the
+link is on the critical path, so the work stays on the GPU wherever possible.
+
+Everything upstream (the tensor-core matvec on repacked K-quants, MTP, the two-user scheduler, tensor-parallel two-card
+serving) is unchanged. Upstream's description follows the [Llama Superfast](#llama-superfast) heading below.
+
+## What we changed
+
+All of it is on the `q8-attention` branch, in four commits on top of upstream `403f06f`.
+
+**1. Q8_0 KV cache on the Volta attention paths** (`bcf1877`, `5c15ec5`)
+
+- Upstream's fast paths (the CUTLASS 6-head prefill attention `fattn-gqa6` and the streaming decode/verify kernel
+  `fattn-verify-stream`) took only an f16 KV cache. `-ctk q8_0 -ctv q8_0` sent every step through the generic kernels
+  over a temporary f16 copy of the cache.
+- Both paths now read `q8_0` directly:
+  - The prefill kernel widens key blocks to f16 in shared memory.
+  - The verify kernel has a `KVQ8` variant with 8-byte row loads and aligned windows.
+  - Allocations no longer reserve the f16 copy for those routes.
+- Context: our server went from two slots of 73,728 tokens (f16 cache, MTP draft) to two slots of 122,880 (`q8_0`,
+  DFlash2 draft, with the VRAM change at the end of section 3). 2 × 131,072 also passes our fill test (both slots full
+  at once, then generation), with about 870 MiB to spare.
+- Tests: `q8_0` cases for both kernels in `test-backend-ops`, including the shapes the 27B uses.
+- Switches: `LLAMA_FA_GQA6_Q8=0` and `LLAMA_FATTN_VERIFY_STREAM_Q8=0` fall back to the generic kernels.
+  `LLAMA_FATTN_VERIFY_STREAM_Q8_KP` and `LLAMA_FATTN_VERIFY_STREAM_Q8_W` tune the verify kernel.
+
+**2. Faster prefill on repacked weights** (`044ef3b`)
+
+- Long prompts expand each weight to fp16 for cuBLAS. The expansion now decodes straight from the repacked layout with
+  16-byte stores, instead of one warp rebuilding the GGUF blocks while the rest of the block waits. It matches ggml's
+  dequantizers bit for bit.
+- Products of 129 to 191 tokens go to MMQ on a device-side unrepack instead of fp16 + cuBLAS. The Volta MMQ crossover is
+  192 tokens (measured: 64 tokens 0.5 ms vs 1.25 ms per 27B FFN product; 256 tokens 1.72 vs 1.50 ms).
+- The tensor-core kernel takes up to 128 tokens by default.
+- Switches:
+  - `LLAMA_QPN_MAX_TOKENS` (default 128, at most 256).
+  - `GGML_CUDA_MMQ_MAX_BATCH` overrides the crossover.
+  - `LLAMA_QPN_MMQ=0` and `LLAMA_QPN_FAST_EXPAND=0` restore the earlier routes.
+  - `LLAMA_QPN_EXPAND_CHECK=1` runs the earlier kernels alongside and reports any difference.
+
+**3. Prompt work kept on the GPU** (`64107c5`)
+
+- **DFlash2 features stay on the device.** The draft reads the target's layer inputs. For any decode that is one ubatch,
+  they now stay on the GPU, and the draft copies only the rows its 2,048-token window can see, device to device. Before,
+  every prefill ubatch shipped all of them to the host and back (about 2.3 GB for a 24k prompt). Run with `-b` equal to
+  `-ub` so prefill qualifies. Verify steps with two slots now take this path too.
+  - Switches: `LLAMA_DFLASH2_FEAT_DEV=0` turns it off; `LLAMA_DFLASH2_FEAT_DEV_ROWS` caps the rows.
+- **Checkpoints copy in the background.** A prompt checkpoint (the 27B's recurrent state, ~150 MiB) is first copied into
+  a GPU staging buffer. It then goes to the host on a second CUDA stream, so the next compute no longer waits for the
+  link. The draft's small state is read first, before the big copy occupies the link.
+  - Switch: `LLAMA_CKPT_STAGE=0` turns staging off.
+- **No duplicate checkpoints.** A checkpoint at the same position as an existing one is kept, not copied again. Before,
+  every new conversation re-saved the shared system prompt's checkpoint.
+  - Switch: `LLAMA_CKPT_KEEP_SAME=0` restores the old behavior.
+- **Cheaper prompt-cache saves.** A save reuses the evicted entries' buffers. It moves checkpoints instead of copying
+  them when the next prompt won't need them.
+- **Two-user scheduler.** A lone prompt is no longer cut into small slices when no other slot is waiting.
+  - Switch: `LLAMA_TU_IDLE_JOB_MIN` sets the minimum slice.
+- **Smaller draft compute buffer.** With `--spec-draft-ubatch 512`, the DFlash2 draft's compute buffer stops being
+  sized for 2,048-token batches. That frees 1.7 GB of VRAM at no measured speed cost.
+
+## Measured (one V100 32 GB, eGPU, Qwen3.8-27B UD-Q4_K_XL, DFlash2, q8_0 KV, two slots)
+
+| | upstream route + q8 KV | this fork |
+|---|---|---|
+| Cold prefill, 34k-token prompt | 832 tok/s | 892 tok/s |
+| Cold prefill, 5.6k-token prompt | 760 tok/s | 851 tok/s |
+| Time to first token, new ~125-token chat turn (median) | 828 ms | 680 ms, 430 ms with `--cache-ram 0` |
+| Decode, 400 tokens, three prompts | 88 / 90 / 104 tok/s | 88 / 91 / 106 tok/s |
+| Context | 2 × 98,304 | 2 × 122,880 |
+
+The "upstream route" column is the same build with this fork's prefill and GPU-residency changes switched off. BetterBench
+results for the full configuration are in progress.
+
+`--cache-ram 0` turns off the host prompt cache. Saving a slot's state to host memory costs about 220 ms over this link
+each time a slot switches conversations. With one user and pinned slots (`id_slot` in the request), the cache brings
+little.
+
+## Run (one card, two slots, DFlash2)
+
+```
+LLAMA_TU=0 LLAMA_DFLASH2_HEAD_FILE=$MODELS/mtp-Qwen3.8-27B-Q4_0.gguf \
+build/bin/llama-server -m $MODELS/Qwen3.8-27B-UD-Q4_K_XL.gguf \
+  -md $MODELS/Qwen3.8-27B-DFlash2-Q4_K_M.gguf --spec-type draft-dflash --spec-draft-n-max 7 --spec-draft-ubatch 512 \
+  -c 245760 --parallel 2 --no-kv-unified -fa on -ngl 99 -ctk q8_0 -ctv q8_0 -ctkd f16 -ctvd f16 \
+  -t 12 -b 2048 -ub 2048 --cache-ram 0 --jinja --temp 1.0 --top-p 0.95 --top-k 20
+```
+
+- `LLAMA_TU=0` is required with DFlash2: the two-user scheduler rejects its long prompts.
+- `LLAMA_DFLASH2_HEAD_FILE` points DFlash2's output head at the MTP file's rows.
+- `-b 2048` (equal to `-ub`) keeps the DFlash2 features on the GPU during prefill.
+
+---
+
 # Llama Superfast
 
 There are many llama forks, but this one is mine :)
