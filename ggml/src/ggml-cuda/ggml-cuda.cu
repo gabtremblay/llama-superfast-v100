@@ -713,10 +713,13 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
     std::vector<std::pair<CUdeviceptr, size_t>> mappings;
 #endif
 
-    explicit ggml_cuda_pool_vmm(int device) :
+    int stream_no = 0;
+
+    explicit ggml_cuda_pool_vmm(int device, int stream_no = 0) :
         device(device),
         physical_device(ggml_cuda_get_physical_device(device)),
-        granularity(ggml_cuda_info().devices[device].vmm_granularity) {
+        granularity(ggml_cuda_info().devices[device].vmm_granularity),
+        stream_no(stream_no) {
     }
 
     ~ggml_cuda_pool_vmm() {
@@ -818,6 +821,14 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
             // add to the pool
             pool_size += reserve_size;
 
+            // GGML_CUDA_POOL_LOG=1: every growth of a pool (it never shrinks: its size is the high-water mark of the
+            // temporaries of one context's stream)
+            static const bool pool_log = getenv("GGML_CUDA_POOL_LOG") != nullptr;
+            if (pool_log) {
+                fprintf(stderr, "cuda pool %p dev %d stream %d: +%zu MiB -> %zu MiB (request %.1f MiB, %.1f MiB in use)\n",
+                        (void *) this, device, stream_no, reserve_size >> 20, pool_size >> 20, size/1048576.0, pool_used/1048576.0);
+            }
+
             //printf("cuda pool[%d]: size increased to %llu MB (reserved %llu MB)\n",
             //       device, (unsigned long long) (pool_size/1024/1024),
             //       (unsigned long long) (reserve_size/1024/1024));
@@ -853,7 +864,7 @@ std::unique_ptr<ggml_cuda_pool> ggml_backend_cuda_context::new_pool_for_device(i
                                                                                [[maybe_unused]] int stream_no) {
 #if defined(GGML_USE_VMM)
     if (ggml_cuda_info().devices[device].vmm) {
-        return std::unique_ptr<ggml_cuda_pool>(new ggml_cuda_pool_vmm(device));
+        return std::unique_ptr<ggml_cuda_pool>(new ggml_cuda_pool_vmm(device, stream_no));
     }
 #endif // defined(GGML_USE_VMM)
     return std::unique_ptr<ggml_cuda_pool>(new ggml_cuda_pool_leg(device));

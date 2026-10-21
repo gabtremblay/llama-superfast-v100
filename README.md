@@ -25,9 +25,13 @@ All of it is on the `q8-attention` branch, in four commits on top of upstream `4
   - The prefill kernel widens key blocks to f16 in shared memory.
   - The verify kernel has a `KVQ8` variant with 8-byte row loads and aligned windows.
   - Allocations no longer reserve the f16 copy for those routes.
-- Context: our server went from two slots of 73,728 tokens (f16 cache, MTP draft) to two slots of 122,880 (`q8_0`,
-  DFlash2 draft, with the VRAM change at the end of section 3). 2 × 131,072 also passes our fill test (both slots full
-  at once, then generation), with about 600 MiB to spare.
+- Context: our server went from two slots of 73,728 tokens (f16 cache, MTP draft) to two slots of 106,496 (`q8_0`,
+  DFlash2 draft, with the VRAM change at the end of section 3). That size passes a full BetterBench run at a peak of
+  31.7–31.8 GB of the card's 32,494 MiB.
+  - A fill test (both slots full at once, then generation) passes up to 2 × 131,072. Under real mixed traffic, though,
+    VRAM keeps growing by about 2.7 GB over the first ~25 minutes before it plateaus. About 1.8 GB of that comes from
+    outside ggml's allocators, and it ran 2 × 122,880 out of memory. Size the context from a long mixed run, not a fill
+    test.
 - Tests: `q8_0` cases for both kernels in `test-backend-ops`, including the shapes the 27B uses.
 - Switches: `LLAMA_FA_GQA6_Q8=0` and `LLAMA_FATTN_VERIFY_STREAM_Q8=0` fall back to the generic kernels.
   `LLAMA_FATTN_VERIFY_STREAM_Q8_KP` and `LLAMA_FATTN_VERIFY_STREAM_Q8_W` tune the verify kernel.
@@ -66,6 +70,11 @@ All of it is on the `q8-attention` branch, in four commits on top of upstream `4
   - Switch: `LLAMA_TU_IDLE_JOB_MIN` sets the minimum slice.
 - **Smaller draft compute buffer.** With `--spec-draft-ubatch 512`, the DFlash2 draft's compute buffer stops being
   sized for 2,048-token batches. That frees 1.7 GB of VRAM at no measured speed cost.
+- **VRAM diagnostics.**
+  - `GGML_CUDA_POOL_LOG=1` logs every growth of a CUDA temporary-buffer pool.
+  - `GGML_CUDA_GRAPH_MAX` (default 512) caps the CUDA graph cache; `GGML_CUDA_GRAPH_TTL_S` (default 600) sets how long an
+    unused graph stays cached.
+  - `GGML_CUDA_GRAPH_STATS=1` logs the cached graph count, at the server's debug log level.
 
 ## Measured (one V100 32 GB, eGPU, Qwen3.8-27B UD-Q4_K_XL, DFlash2, q8_0 KV, two slots)
 
@@ -75,7 +84,7 @@ All of it is on the `q8-attention` branch, in four commits on top of upstream `4
 | Cold prefill, 5.6k-token prompt | 760 tok/s | 851 tok/s |
 | Time to first token, new ~125-token chat turn (median) | 828 ms | 680 ms, 430 ms with `--cache-ram 0` |
 | Decode, 400 tokens, three prompts | 88 / 90 / 104 tok/s | 88 / 91 / 106 tok/s |
-| Context | 2 × 98,304 | 2 × 122,880 |
+| Context | 2 × 98,304 | 2 × 106,496 |
 
 The "upstream route" column is the same build with this fork's prefill and GPU-residency changes switched off. BetterBench
 results for the full configuration are in progress.
@@ -90,7 +99,7 @@ little.
 LLAMA_TU=0 LLAMA_DFLASH2_HEAD_FILE=$MODELS/mtp-Qwen3.8-27B-Q4_0.gguf \
 build/bin/llama-server -m $MODELS/Qwen3.8-27B-UD-Q4_K_XL.gguf \
   -md $MODELS/Qwen3.8-27B-DFlash2-Q4_K_M.gguf --spec-type draft-dflash --spec-draft-n-max 7 --spec-draft-ubatch 512 \
-  -c 245760 --parallel 2 --no-kv-unified -fa on -ngl 99 -ctk q8_0 -ctv q8_0 -ctkd f16 -ctvd f16 \
+  -c 212992 --parallel 2 --no-kv-unified -fa on -ngl 99 -ctk q8_0 -ctv q8_0 -ctkd f16 -ctvd f16 \
   -t 12 -b 2048 -ub 2048 --cache-ram 0 --jinja --temp 1.0 --top-p 0.95 --top-k 20
 ```
 

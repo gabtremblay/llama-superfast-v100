@@ -1497,9 +1497,29 @@ struct ggml_backend_cuda_context {
 #ifdef USE_CUDA_GRAPH
     std::unordered_map<uint64_t, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;
 
-    static const size_t max_cuda_graphs = 512;
+    // [TAG_GRAPH_CACHE] at most GGML_CUDA_GRAPH_MAX entries (default 512), each evicted after GGML_CUDA_GRAPH_TTL_S seconds
+    // unused (default 600). An instantiated graph holds device memory: under mixed prompt lengths the 27B's cache filled over
+    // ~25 minutes and took ~2 GB, which a context sized by a fill test does not leave. GGML_CUDA_GRAPH_STATS=1 logs the count
+    // of entries and of instantiated graphs when it changes
+    static size_t graph_cache_max() {
+        static const size_t n = [] {
+            const char * e = getenv("GGML_CUDA_GRAPH_MAX");
+            const long v = e ? atol(e) : 512;
+            return (size_t) (v < 1 ? 1 : v);
+        }();
+        return n;
+    }
+    static int64_t graph_cache_ttl_us() {
+        static const int64_t t = [] {
+            const char * e = getenv("GGML_CUDA_GRAPH_TTL_S");
+            const long v = e ? atol(e) : 600;
+            return (int64_t) (v < 1 ? 1 : v) * 1000000;
+        }();
+        return t;
+    }
 
     int64_t last_graph_eviction_sweep = 0;
+    size_t  graph_stats_last = (size_t) -1;
 
     ggml_cuda_graph * cuda_graph(uint64_t graph_key) {
         const int64_t time_now = ggml_time_us();
@@ -1509,18 +1529,26 @@ struct ggml_backend_cuda_context {
         // often take longer than 10 s)
         if (time_now - last_graph_eviction_sweep >= 5'000'000) {
             last_graph_eviction_sweep = time_now;
+            size_t n_inst = 0;
             for (auto it = cuda_graphs.begin(); it != cuda_graphs.end(); ) {
-                if (time_now - it->second->last_used_time >= 600'000'000) {
+                if (time_now - it->second->last_used_time >= graph_cache_ttl_us()) {
                     it = cuda_graphs.erase(it);
                 } else {
+                    n_inst += it->second->instance != nullptr;
                     ++it;
                 }
+            }
+            static const bool stats = getenv("GGML_CUDA_GRAPH_STATS") != nullptr;
+            if (stats && n_inst != graph_stats_last) {
+                graph_stats_last = n_inst;
+                GGML_LOG_INFO("cuda graphs: %zu entries, %zu instantiated (max %zu, ttl %lld s)\n", cuda_graphs.size(), n_inst,
+                        graph_cache_max(), (long long) (graph_cache_ttl_us()/1000000));
             }
         }
 
         auto it = cuda_graphs.find(graph_key);
         if (it == cuda_graphs.end()) {
-            while (cuda_graphs.size() >= max_cuda_graphs) {
+            while (cuda_graphs.size() >= graph_cache_max()) {
                 auto lru = cuda_graphs.begin();
                 for (auto c = cuda_graphs.begin(); c != cuda_graphs.end(); ++c) {
                     if (c->second->last_used_time < lru->second->last_used_time) {
