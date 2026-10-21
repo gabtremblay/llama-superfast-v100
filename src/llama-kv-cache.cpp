@@ -323,6 +323,7 @@ llama_kv_cache::llama_kv_cache(
         ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(first->buffer));
         ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
         kqm_fn = ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_kq_mask");
+        kqm_n_mirror = n_stream == 1 ? std::min<uint32_t>(n_seq_max, LLAMA_MAX_SEQ) : n_stream;
         if (kqm_fn) {
             this->kqm_buft = kqm_buft;
             for (size_t j = 0; j < n; ++j) {
@@ -332,7 +333,7 @@ llama_kv_cache::llama_kv_cache(
                 if (!ctx) {
                     throw std::runtime_error("failed to allocate KQ mirror context");
                 }
-                auto mirror = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, 3*(int64_t) kv_size*n_stream);
+                auto mirror = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, 3*(int64_t) kv_size*kqm_n_mirror);
                 ggml_format_name(mirror, "cache_%skqm_cells_%zu", name_tag, j);
                 ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft));
                 if (!buf) {
@@ -343,12 +344,22 @@ llama_kv_cache::llama_kv_cache(
                 LLAMA_LOG_INFO("%s: KQ mask built on the device %s from a %.2f MiB cell mirror (LLAMA_KQ_MASK_DEVICE=0 to disable)\n",
                         __func__, ggml_backend_buft_name(buft), ggml_nbytes(mirror)/1024.0/1024.0);
             }
-            kqm_epoch.assign(n_stream, 0);
-            kqm_cursor.assign(n_stream, 0);
+            kqm_epoch.assign(kqm_n_mirror, 0);
+            kqm_cursor.assign(kqm_n_mirror, 0);
             for (auto & cells : v_cells) {
                 cells.cjrnl_enable();
             }
         }
+    }
+
+    // [TAG_KV_WINDOW] the qwen35 line's attention reads K/V views and the dense mask only, which take the window's offset; the
+    // banded, sparse and bucketed paths of other models do not
+    {
+        const char * e  = getenv("LLAMA_KV_WINDOW");
+        const char * em = getenv("LLAMA_KV_WINDOW_MIN_TOKENS");
+        kv_window = (e == nullptr || atoi(e) != 0) && n_stream == 1 && n_seq_max > 1 && !v_trans &&
+            (model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE);
+        kv_window_min_tok = em ? (uint32_t) std::max(1, atoi(em)) : 1;
     }
 
     // decode graphs over the whole cache. From whole_min used keys on, a ubatch of at most whole_max_tok tokens attends
@@ -1417,6 +1428,43 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
     return result;
 }
 
+void llama_kv_cache::get_kv_window(const slot_info & sinfo, const llama_ubatch & ubatch, uint32_t n_kv_eff, uint32_t & lo, uint32_t & hi) const {
+    lo = 0;
+    hi = n_kv_eff;
+    if (!kv_window || sinfo.n_stream() != 1 || ubatch.n_tokens < kv_window_min_tok || ubatch.n_seqs_unq == 0) {
+        return;
+    }
+
+    const auto & cells = v_cells[sinfo.strm[0]];
+
+    uint32_t mn = UINT32_MAX;
+    uint32_t mx = 0;
+    const uint32_t n = std::min<uint32_t>(cells.used_max_p1(), n_kv_eff);
+    for (uint32_t j = 0; j < n; ++j) {
+        if (cells.is_empty(j)) {
+            continue;
+        }
+        for (uint32_t k = 0; k < ubatch.n_seqs_unq; ++k) {
+            if (cells.seq_has(j, ubatch.seq_id_unq[k])) {
+                mn = std::min(mn, j);
+                mx = j;
+                break;
+            }
+        }
+    }
+    if (mn == UINT32_MAX) {
+        return;
+    }
+
+    const uint32_t a = std::max(n_pad, 256u);
+    const uint32_t l = mn / a * a;
+    const uint32_t h = std::min(n_kv_eff, GGML_PAD(mx + 1, a));
+    if (h > l && (l > 0 || h < n_kv_eff)) {
+        lo = l;
+        hi = h;
+    }
+}
+
 uint32_t llama_kv_cache::get_n_kv_pos_contiguous(const slot_info & sinfo, const llama_ubatch & ubatch) const {
     if (sinfo.n_stream() != 1 || ubatch.n_seqs_unq != 1 || ubatch.n_tokens == 0 ||
         ubatch.pos == nullptr || ubatch.n_seq_id == nullptr ||
@@ -1462,7 +1510,7 @@ uint32_t llama_kv_cache::get_n_kv_pos_contiguous(const slot_info & sinfo, const 
     return pos_max + 1;
 }
 
-ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
+ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo, uint32_t kv_lo) const {
     const int32_t ikv = map_layer_ids.at(il);
 
     auto * k = layers[ikv].k;
@@ -1479,10 +1527,10 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
             ggml_row_size(k->type, hparams.n_embd_head_k(il)),
             ggml_row_size(k->type, n_embd_k_gqa),
             ggml_row_size(k->type, n_embd_k_gqa*kv_size),
-            ggml_row_size(k->type, n_embd_k_gqa*kv_size)*sinfo.s0);
+            ggml_row_size(k->type, n_embd_k_gqa*kv_size)*sinfo.s0 + ggml_row_size(k->type, n_embd_k_gqa)*kv_lo);
 }
 
-ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
+ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo, uint32_t kv_lo) const {
     const int32_t ikv = map_layer_ids.at(il);
 
     auto * v = layers[ikv].v;
@@ -1502,8 +1550,10 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
                 ggml_row_size(v->type, hparams.n_embd_head_v(il)),          // v->nb[1]
                 ggml_row_size(v->type, n_embd_v_gqa),                   // v->nb[2]
                 ggml_row_size(v->type, n_embd_v_gqa*kv_size),           // v->nb[3]
-                ggml_row_size(v->type, n_embd_v_gqa*kv_size)*sinfo.s0);
+                ggml_row_size(v->type, n_embd_v_gqa*kv_size)*sinfo.s0 + ggml_row_size(v->type, n_embd_v_gqa)*kv_lo);
     }
+
+    GGML_ASSERT(kv_lo == 0 && "a window over a transposed V");
 
     // note: v->nb[1] > v->nb[2]
     return ggml_view_4d(ctx, v,
@@ -1786,6 +1836,8 @@ struct args_set_input_kq_mask {
     int64_t n_kv;
     int64_t n_stream;
     int64_t n_tps;
+
+    int64_t kv_lo; // [TAG_KV_WINDOW] column j of the mask is cell kv_lo + j
 };
 
 // the KQ mask entries of a visible and a dropped cell. the uint8_t form is set_input_kq_vis's byte per cell,
@@ -1885,16 +1937,19 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
                     }
                 }
 
-                if (cells.is_empty(j)) {
+                {
+                const uint32_t c = j + (uint32_t) args.kv_lo;
+
+                if (cells.is_empty(c)) {
                     goto skip;
                 }
 
                 // mask the token if not the same sequence
-                if (!cells.seq_has(j, seq_id)) {
+                if (!cells.seq_has(c, seq_id)) {
                     goto skip;
                 }
 
-                p0 = cells.pos_get(j);
+                p0 = cells.pos_get(c);
 
                 if (!alibi) {
                     if (!prev) {
@@ -1914,7 +1969,7 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
                     // M-RoPE causal mask
                     if (is_2d) {
                         if (p0 == p1) {
-                            const auto & p0_ext = cells.ext_get(j);
+                            const auto & p0_ext = cells.ext_get(c);
 
                             if (p0_ext.is_2d_gt(p1_x, p1_y)) {
                                 goto skip;
@@ -1939,6 +1994,7 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
                 }
 
                 continue;
+                }
 skip:
                 data[idst + j] = mask_drop;
             }
@@ -1985,7 +2041,7 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
     }
 }
 
-void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
+void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, uint32_t kv_lo) const {
     const uint32_t n_tokens = ubatch->n_tokens;
 
     const int64_t n_kv     = dst->ne[0];
@@ -1999,7 +2055,7 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
     // [TAG_KQ_MASK_DEVICE] a mask placed on the device (kq_mask_device_backend) is built there when the ubatch allows it
     const bool on_host = ggml_backend_buffer_is_host(dst->buffer);
     bool check = false;
-    if (!on_host && set_input_kq_mask_device(dst, ubatch, causal_attn)) {
+    if (!on_host && set_input_kq_mask_device(dst, ubatch, causal_attn, kv_lo)) {
         // Compare the first N masks, including prompt ubatches and every TP rank.
         static int check_left = [] { const char * e = getenv("LLAMA_KQ_MASK_DEVICE_CHECK"); return e ? atoi(e) : 0; }();
         if (check_left <= 0) {
@@ -2027,6 +2083,7 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
         /*.n_kv             =*/ n_kv,
         /*.n_stream         =*/ n_stream,
         /*.n_tps            =*/ n_tps,
+        /*.kv_lo            =*/ (int64_t) kv_lo,
     };
 
     // [TAG_KQ_MASK_DEVICE] a device mask this ubatch cannot build there is written on the host and uploaded
@@ -2127,6 +2184,7 @@ void llama_kv_cache::set_input_kq_vis(ggml_tensor * dst, const llama_ubatch * ub
         /*.n_kv             =*/ n_kv,
         /*.n_stream         =*/ n_stream,
         /*.n_tps            =*/ n_tps,
+        /*.kv_lo            =*/ 0,
     };
 
     const size_t n_bytes = (size_t) n_kv*n_tokens;
@@ -2216,7 +2274,7 @@ void llama_kv_cache::set_input_kq_vis(ggml_tensor * dst, const llama_ubatch * ub
 // mask on the backend's stream, before the graph that reads it.
 typedef bool (*kqm_fn_t)(ggml_backend_t backend, ggml_tensor * mask, ggml_tensor * cells,
         const int32_t * p, const int32_t * py, const int32_t * px, int32_t n_tokens, bool use_2d,
-        const int32_t * upd, int32_t upd_lo, int32_t upd_n);
+        const int32_t * upd, int32_t upd_lo, int32_t upd_n, int32_t kv_lo);
 
 ggml_backend_t llama_kv_cache::kq_mask_device_backend(ggml_backend_sched_t sched, const ggml_tensor * mask, bool causal_attn) const {
     if (kqm_cells.empty() || mask == nullptr || sched == nullptr) {
@@ -2244,7 +2302,7 @@ ggml_backend_t llama_kv_cache::kq_mask_device_backend(ggml_backend_sched_t sched
     return nullptr;
 }
 
-bool llama_kv_cache::set_input_kq_mask_device(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
+bool llama_kv_cache::set_input_kq_mask_device(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, uint32_t kv_lo) const {
     if (kqm_cells.empty() || kqm_backend == nullptr || kqm_fn == nullptr) {
         return false;
     }
@@ -2255,8 +2313,9 @@ bool llama_kv_cache::set_input_kq_mask_device(ggml_tensor * dst, const llama_uba
         causal_attn = swa_type == LLAMA_SWA_TYPE_NONE;
     }
 
-    // the ubatch's tokens in ns groups of n_tps (one per stream of the mask, [n_kv, n_tps, 1, ns]), each group one
-    // sequence, the one its stream's mirror holds (sequence 0 with one stream, sequence s in stream s)
+    // the mask's rows in groups that each belong to one sequence and read that sequence's mirror: with several streams, the
+    // ns groups of n_tps rows ([n_kv, n_tps, 1, ns]), sequence s in stream s; with one stream (a unified cache), each run of
+    // consecutive rows of one sequence (a mixed ubatch of two slots is two runs). The columns are cells kv_lo .. kv_lo + n_kv
     const int64_t ns = dst->ne[3];
     if (dst->type != GGML_TYPE_F16 || n_tokens == 0 || ns < 1 || ns > n_stream || n_tokens % ns != 0 || dst->ne[1]*ns != n_tokens ||
             dst->ne[2] != 1 || !causal_attn || swa_type != LLAMA_SWA_TYPE_NONE || hparams.use_alibi) {
@@ -2264,52 +2323,71 @@ bool llama_kv_cache::set_input_kq_mask_device(ggml_tensor * dst, const llama_uba
     }
     const uint32_t n_tps = n_tokens/ns;
 
-    uint32_t strm[LLAMA_MAX_SEQ];
+    struct kqm_group {
+        uint32_t     slab;   // the mask's stream (dim 3)
+        uint32_t     row0;   // first row within it
+        uint32_t     n_rows;
+        uint32_t     strm;   // the cache stream
+        uint32_t     m;      // the mirror
+        llama_seq_id seq;
+    };
+    std::vector<kqm_group> groups;
     for (int64_t g = 0; g < ns; ++g) {
-        const llama_seq_id seq = ubatch->seq_id[g*n_tps][0];
-        if (seq < 0 || seq >= (llama_seq_id) seq_to_stream.size()) {
+        const llama_seq_id seq0 = ubatch->seq_id[g*n_tps][0];
+        if (seq0 < 0 || seq0 >= (llama_seq_id) seq_to_stream.size()) {
             return false;
         }
-        const uint32_t s = seq_to_stream[seq];
-        if (seq != (n_stream == 1 ? 0 : (llama_seq_id) s)) {
+        const uint32_t s = seq_to_stream[seq0];
+        if (n_stream > 1 && seq0 != (llama_seq_id) s) {
             return false;
         }
-        for (uint32_t ii = 0; ii < n_tps; ++ii) {
-            if (ubatch->seq_id[g*n_tps + ii][0] != seq) {
+        if (!v_cells[s].cjrnl_enabled() || (uint64_t) dst->ne[0] + kv_lo > v_cells[s].size()) {
+            return false;
+        }
+        for (uint32_t r = 0; r < n_tps; ) {
+            const llama_seq_id seq = ubatch->seq_id[g*n_tps + r][0];
+            uint32_t r1 = r + 1;
+            while (r1 < n_tps && ubatch->seq_id[g*n_tps + r1][0] == seq) {
+                ++r1;
+            }
+            if (n_stream > 1 ? seq != seq0 : (seq < 0 || (uint32_t) seq >= kqm_n_mirror || seq_to_stream[seq] != s)) {
                 return false;
             }
+            groups.push_back({ (uint32_t) g, r, r1 - r, s, n_stream > 1 ? s : (uint32_t) seq, seq });
+            r = r1;
         }
-        if (!v_cells[s].cjrnl_enabled() || (uint32_t) dst->ne[0] > v_cells[s].size()) {
-            return false;
-        }
-        strm[g] = s;
     }
 
     const bool is_2d = ubatch->is_pos_2d();
+    std::vector<bool> fresh(kqm_n_mirror, false); // the mirror took this call's journal already
 
-    for (int64_t g = 0; g < ns; ++g) {
-        const uint32_t s     = strm[g];
-        const auto   & cells = v_cells[s];
-        const llama_seq_id mseq = n_stream == 1 ? 0 : (llama_seq_id) s;
+    for (size_t gi = 0; gi < groups.size(); ++gi) {
+        const auto & grp   = groups[gi];
+        const uint32_t s   = grp.strm;
+        const uint32_t m   = grp.m;
+        const auto & cells = v_cells[s];
 
-        const int32_t * p  = ubatch->pos + g*n_tps;
-        const int32_t * py = is_2d ? p + n_tokens : nullptr;
-        const int32_t * px = is_2d ? p + 2*n_tokens : nullptr;
+        const uint32_t i0 = grp.slab*n_tps + grp.row0;
+        const int32_t * p  = ubatch->pos + i0;
+        const int32_t * py = is_2d ? ubatch->pos + n_tokens + i0 : nullptr;
+        const int32_t * px = is_2d ? ubatch->pos + 2*n_tokens + i0 : nullptr;
 
-        // the cells of stream s that changed since its mirror was last written
+        // the cells of stream s that changed since mirror m was last written
         const uint64_t epoch = cells.cjrnl_epoch();
         const uint64_t end   = cells.cjrnl_end();
 
         uint32_t lo = 0;
         uint32_t hi = 0;
-        if (epoch != kqm_epoch[s] || kqm_cursor[s] < cells.cjrnl_base()) {
-            hi = cells.size();
-        } else if (kqm_cursor[s] < end) {
-            lo = UINT32_MAX;
-            for (uint64_t k = kqm_cursor[s]; k < end; ++k) {
-                const uint32_t j = cells.cjrnl_get(k);
-                lo = std::min(lo, j);
-                hi = std::max(hi, j + 1);
+        if (!fresh[m]) {
+            if (epoch != kqm_epoch[m] || kqm_cursor[m] < cells.cjrnl_base()) {
+                hi = cells.size();
+            } else if (kqm_cursor[m] < end) {
+                lo = UINT32_MAX;
+                for (uint64_t k = kqm_cursor[m]; k < end; ++k) {
+                    const uint32_t j = cells.cjrnl_get(k);
+                    lo = std::min(lo, j);
+                    hi = std::max(hi, j + 1);
+                }
             }
         }
 
@@ -2319,7 +2397,7 @@ bool llama_kv_cache::set_input_kq_mask_device(ggml_tensor * dst, const llama_uba
         for (uint32_t u = 0; u < n_upd; ++u) {
             const uint32_t j = lo + u;
             const bool empty = cells.is_empty(j);
-            upd[u]           = !empty && cells.seq_has(j, mseq) ? cells.pos_get(j) : -1;
+            upd[u]           = !empty && cells.seq_has(j, grp.seq) ? cells.pos_get(j) : -1;
             upd[n_upd + u]   = !empty ? cells.ext_get(j).y : 0;
             upd[2*n_upd + u] = !empty ? cells.ext_get(j).x : 0;
         }
@@ -2331,23 +2409,25 @@ bool llama_kv_cache::set_input_kq_mask_device(ggml_tensor * dst, const llama_uba
             auto backend = split ? ggml_backend_meta_simple_backend(kqm_backend, j) : kqm_backend;
             GGML_ASSERT(simple != nullptr);
             ggml_tensor mask_g = *simple;
-            mask_g.data  = (char *) simple->data + g*simple->nb[3];
+            mask_g.data  = (char *) simple->data + grp.slab*simple->nb[3] + grp.row0*simple->nb[1];
+            mask_g.ne[1] = grp.n_rows;
             mask_g.ne[3] = 1;
             ggml_tensor cells_g = *kqm_cells[j];
             cells_g.ne[0] = 3*(int64_t) cells.size();
-            cells_g.data  = (char *) kqm_cells[j]->data + (size_t) s*3*cells.size()*sizeof(int32_t);
+            cells_g.data  = (char *) kqm_cells[j]->data + (size_t) m*3*cells.size()*sizeof(int32_t);
 
             // Same simple backend/stream as meta graph_compute; no host fence.
-            const bool ok = ((kqm_fn_t) kqm_fn)(backend, &mask_g, &cells_g, p, py, px, (int32_t) n_tps, is_2d,
-                    upd.data(), (int32_t) lo, (int32_t) n_upd);
-            GGML_ASSERT(ok || (g == 0 && j == 0));
+            const bool ok = ((kqm_fn_t) kqm_fn)(backend, &mask_g, &cells_g, p, py, px, (int32_t) grp.n_rows, is_2d,
+                    upd.data(), (int32_t) lo, (int32_t) n_upd, (int32_t) kv_lo);
+            GGML_ASSERT(ok || (gi == 0 && j == 0));
             if (!ok) {
                 return false;
             }
         }
 
-        kqm_epoch [s] = epoch;
-        kqm_cursor[s] = end;
+        kqm_epoch [m] = epoch;
+        kqm_cursor[m] = end;
+        fresh[m] = true;
     }
 
     return true;
@@ -3332,6 +3412,16 @@ bool llama_kv_cache_context::apply() {
         n_kv_eff >= (uint32_t) kv->get_whole_min() && n_kv_eff % 256 == 0;
     n_kv = whole ? kv->get_size() : n_kv_eff;
 
+    // [TAG_KV_WINDOW] a ubatch of a unified cache reads only its sequences' cells
+    kv_lo = 0;
+    if (!whole) {
+        uint32_t lo = 0;
+        uint32_t hi = n_kv_eff;
+        kv->get_kv_window(sinfo, ubatches[i_cur], n_kv_eff, lo, hi);
+        kv_lo = lo;
+        n_kv  = hi - lo;
+    }
+
     return true;
 }
 
@@ -3369,7 +3459,7 @@ uint32_t llama_kv_cache_context::get_n_kv_pos_contiguous() const {
     }
 
     const uint32_t result = kv->get_n_kv_pos_contiguous(sinfos[i_cur], ubatches[i_cur]);
-    return result <= (uint32_t) n_kv ? result : 0;
+    return kv_lo == 0 && result <= (uint32_t) n_kv ? result : 0;
 }
 
 ggml_type llama_kv_cache_context::type_k() const {
@@ -3397,11 +3487,11 @@ const llama_kv_cache * llama_kv_cache_context::get_kv() const {
 }
 
 ggml_tensor * llama_kv_cache_context::get_k(ggml_context * ctx, int32_t il) const {
-    return kv->get_k(ctx, il, n_kv, sinfos[i_cur]);
+    return kv->get_k(ctx, il, n_kv, sinfos[i_cur], kv_lo);
 }
 
 ggml_tensor * llama_kv_cache_context::get_v(ggml_context * ctx, int32_t il) const {
-    return kv->get_v(ctx, il, n_kv, sinfos[i_cur]);
+    return kv->get_v(ctx, il, n_kv, sinfos[i_cur], kv_lo);
 }
 
 ggml_tensor * llama_kv_cache_context::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const {
@@ -3457,10 +3547,11 @@ void llama_kv_cache_context::set_input_v_idxs(ggml_tensor * dst, const llama_uba
 }
 
 void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
-    kv->set_input_kq_mask(dst, ubatch, causal_attn);
+    kv->set_input_kq_mask(dst, ubatch, causal_attn, kv_lo);
 }
 
 void llama_kv_cache_context::set_input_kq_vis(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
+    GGML_ASSERT(kv_lo == 0 && "the sparse mask takes no window");
     kv->set_input_kq_vis(dst, ubatch, causal_attn, n_kv);
 }
 
@@ -3469,10 +3560,12 @@ ggml_backend_t llama_kv_cache_context::kq_mask_device_backend(ggml_backend_sched
 }
 
 void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+    GGML_ASSERT(kv_lo == 0 && "position buckets take no window");
     kv->set_input_pos_bucket(dst, ubatch);
 }
 
 void llama_kv_cache_context::set_input_pos_rel_flat(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const {
+    GGML_ASSERT(kv_lo == 0 && "relative positions take no window");
     kv->set_input_pos_rel_flat(dst, ubatch, extent);
 }
 

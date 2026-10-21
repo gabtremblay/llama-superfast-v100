@@ -1137,7 +1137,7 @@ static bool ggml_backend_cuda_upload_nosync(ggml_tensor * tensor, const void * d
 // writes the mask on the host)
 static bool ggml_backend_cuda_kq_mask(ggml_backend_t backend, ggml_tensor * mask, ggml_tensor * cells,
         const int32_t * p, const int32_t * py, const int32_t * px, int32_t n_tokens, bool use_2d,
-        const int32_t * upd, int32_t upd_lo, int32_t upd_n) {
+        const int32_t * upd, int32_t upd_lo, int32_t upd_n, int32_t kv_lo) {
     if (backend == nullptr || !ggml_backend_is_cuda(backend) || mask == nullptr || cells == nullptr) {
         return false;
     }
@@ -1160,14 +1160,14 @@ static bool ggml_backend_cuda_kq_mask(ggml_backend_t backend, ggml_tensor * mask
     }
 
     const int64_t kv_size = cells->ne[0] / 3;
-    if (mask->ne[0] > kv_size) {
+    if (kv_lo < 0 || kv_lo % 8 != 0 || kv_lo + mask->ne[0] > kv_size) {
         return false;
     }
 
     GGML_RT_SCOPE("cuda.kq_mask");
     ggml_cuda_set_device(ctx->device);
     ggml_cuda_kq_mask(*ctx, (half *) mask->data, mask->ne[0], (int32_t *) cells->data, kv_size,
-            p, py, px, n_tokens, use_2d, upd, upd_lo, upd_n);
+            p, py, px, n_tokens, use_2d, upd, upd_lo, upd_n, kv_lo);
     return true;
 }
 

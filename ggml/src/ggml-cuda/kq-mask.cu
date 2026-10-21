@@ -8,7 +8,8 @@ struct kqm_args {
     int32_t n_tokens;
     int32_t n_kv;
     int32_t kv_size;
-    int32_t n_cols;   // cells covered: max(n_kv, upd_lo + upd_n)
+    int32_t n_cols;   // cells covered: max(kv_lo + n_kv, upd_lo + upd_n)
+    int32_t kv_lo;    // the mask's first column is this cell
     int32_t use_2d;
     int32_t upd_lo;
     int32_t upd_n;    // <= KQM_MAX_UPD
@@ -48,12 +49,14 @@ static __global__ void kq_mask_kernel(const kqm_args a, uint16_t * __restrict__ 
             cells[j]               = v[e];
             cells[a.kv_size + j]   = y[e];
             cells[2*a.kv_size + j] = x[e];
-        } else if (j < a.n_kv) {
+        } else if (j >= a.kv_lo && j < a.kv_lo + a.n_kv) {
             v[e] = cells[j];
         }
     }
 
-    if (j0 >= a.n_kv) {
+    // the mask's columns: cells kv_lo .. kv_lo + n_kv (kv_lo is a multiple of 8, so c0 is too)
+    const int c0 = j0 - a.kv_lo;
+    if (c0 < 0 || c0 >= a.n_kv) {
         return;
     }
 
@@ -80,18 +83,18 @@ static __global__ void kq_mask_kernel(const kqm_args a, uint16_t * __restrict__ 
         }
 
         uint16_t * row = mask + (int64_t) i*a.n_kv;
-        if (vec && j0 + 8 <= a.n_kv) {
+        if (vec && c0 + 8 <= a.n_kv) {
             uint4 w;
             w.x = out[0] | ((uint32_t) out[1] << 16);
             w.y = out[2] | ((uint32_t) out[3] << 16);
             w.z = out[4] | ((uint32_t) out[5] << 16);
             w.w = out[6] | ((uint32_t) out[7] << 16);
-            *(uint4 *) (row + j0) = w;
+            *(uint4 *) (row + c0) = w;
         } else {
 #pragma unroll
             for (int e = 0; e < 8; ++e) {
-                if (j0 + e < a.n_kv) {
-                    row[j0 + e] = out[e];
+                if (c0 + e < a.n_kv) {
+                    row[c0 + e] = out[e];
                 }
             }
         }
@@ -100,9 +103,9 @@ static __global__ void kq_mask_kernel(const kqm_args a, uint16_t * __restrict__ 
 
 void ggml_cuda_kq_mask(ggml_backend_cuda_context & ctx, half * mask, int64_t n_kv, int32_t * cells, int64_t kv_size,
         const int32_t * p, const int32_t * py, const int32_t * px, int32_t n_tokens, bool use_2d,
-        const int32_t * upd, int32_t upd_lo, int32_t upd_n) {
+        const int32_t * upd, int32_t upd_lo, int32_t upd_n, int32_t kv_lo) {
     GGML_ASSERT(n_tokens > 0);
-    GGML_ASSERT(n_kv <= kv_size && upd_lo >= 0 && upd_n >= 0 && upd_lo + (int64_t) upd_n <= kv_size);
+    GGML_ASSERT(kv_lo >= 0 && kv_lo % 8 == 0 && kv_lo + n_kv <= kv_size && upd_lo >= 0 && upd_n >= 0 && upd_lo + (int64_t) upd_n <= kv_size);
     cudaStream_t stream = ctx.stream();
 
     kqm_args a;
@@ -112,6 +115,7 @@ void ggml_cuda_kq_mask(ggml_backend_cuda_context & ctx, half * mask, int64_t n_k
     a.use_2d   = use_2d ? 1 : 0;
     a.upd_lo   = upd_lo;
     a.upd_n    = upd_n;
+    a.kv_lo    = kv_lo;
     // Decode keeps the zero-copy argument path. Prompt rows use a stream-ordered
     // pool buffer; it cannot be reused before this stream's kernel has read it.
     ggml_cuda_pool_alloc<int32_t> rows(ctx.pool());
@@ -145,7 +149,7 @@ void ggml_cuda_kq_mask(ggml_backend_cuda_context & ctx, half * mask, int64_t n_k
         }
     }
 
-    a.n_cols = (int32_t) std::max<int64_t>(n_kv, (int64_t) a.upd_lo + a.upd_n);
+    a.n_cols = (int32_t) std::max<int64_t>((int64_t) kv_lo + n_kv, (int64_t) a.upd_lo + a.upd_n);
 
     const int threads = 128;
     const int blocks  = (int) ((a.n_cols + 8*threads - 1) / (8*threads));

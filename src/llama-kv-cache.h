@@ -202,8 +202,16 @@ public:
     uint32_t get_n_kv_pos_contiguous(const slot_info & sinfo, const llama_ubatch & ubatch) const;
 
     // get views of the current state of the cache
-    ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
-    ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
+    // [TAG_KV_WINDOW] kv_lo: the view starts at that cell (get_kv_window)
+    ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo, uint32_t kv_lo = 0) const;
+    ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo, uint32_t kv_lo = 0) const;
+
+    // [TAG_KV_WINDOW] the cells [lo, hi) a ubatch's attention reads in a unified cache: from the first to the last cell of its
+    // sequences, aligned to 256. Two sequences share one cache there, so without it every prompt attended (masked) over the other
+    // slot's cells too: a 24k prompt with 66k tokens in the other slot read at 550 instead of 915 t/s, and decode ran at 72-77
+    // instead of 88-106 t/s. The scan of the cells costs less than a decode step saves. lo = 0, hi = n_kv_eff when it does not
+    // apply (kv_window off, several streams, or fewer than kv_window_min_tok tokens)
+    void get_kv_window(const slot_info & sinfo, const llama_ubatch & ubatch, uint32_t n_kv_eff, uint32_t & lo, uint32_t & hi) const;
 
     // store k_cur and v_cur in the cache based on the provided head location
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
@@ -250,7 +258,7 @@ public:
 
     void set_input_k_shift(ggml_tensor * dst) const;
 
-    void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+    void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, uint32_t kv_lo = 0) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     // the KQ mask over the first n_kv cells as one bit per cell, 1 where set_input_kq_mask writes 0 and 0 where it
@@ -366,7 +374,14 @@ private:
     mutable std::vector<uint64_t> kqm_epoch;  // per stream
     mutable std::vector<uint64_t> kqm_cursor; // per stream
 
-    bool set_input_kq_mask_device(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+    bool set_input_kq_mask_device(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, uint32_t kv_lo) const;
+
+    // [TAG_KQ_MASK_DEVICE] mirrors in kqm_cells: one per stream, or with one stream (a unified cache) one per sequence
+    uint32_t kqm_n_mirror = 0;
+
+    // [TAG_KV_WINDOW] see get_kv_window. LLAMA_KV_WINDOW=0: off; LLAMA_KV_WINDOW_MIN_TOKENS (default 1)
+    bool     kv_window         = false;
+    uint32_t kv_window_min_tok = 1;
 
     // maps from a sequence id to a stream id
     std::vector<uint32_t> seq_to_stream;
@@ -462,6 +477,9 @@ public:
     uint32_t get_n_kv_eff() const;
     bool     is_whole()     const;
 
+    // [TAG_KV_WINDOW] the first cell of the K/V views and of the mask's columns (get_kv_window), 0 when it does not apply
+    uint32_t get_kv_lo() const { return kv_lo; }
+
     // the stream RANGE s1 - s0 + 1 that get_k/get_v use as `ns`, not n_seqs_unq
     uint32_t get_n_stream() const;
 
@@ -556,4 +574,5 @@ private:
     // the used key count, and whether the graph covers the whole cache with n_kv_eff passed as data
     uint32_t n_kv_eff = 0;
     bool     whole    = false;
+    uint32_t kv_lo    = 0;
 };

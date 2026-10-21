@@ -43,6 +43,10 @@ static ggml_tensor * build_attn_inp_kq_mask(
     ggml_set_input(res);
     ggml_set_name(res, "attn_inp_kq_mask");
 
+    // [TAG_KV_WINDOW] the K/V views of this graph start at that cell: a reuse must have the same (an input leaf's op_params are
+    // otherwise unused)
+    res->op_params[0] = (int32_t) mctx->get_kv_lo();
+
     return res;
 }
 
@@ -58,6 +62,7 @@ static bool can_reuse_kq_mask(
     bool res = true;
 
     res &= (kq_mask->ne[0] == n_kv);
+    res &= (kq_mask->op_params[0] == (int32_t) mctx->get_kv_lo());
     res &= (kq_mask->ne[1] == n_tokens/n_stream);
     res &= (kq_mask->ne[2] == 1);
     res &= (kq_mask->ne[3] == n_stream);
