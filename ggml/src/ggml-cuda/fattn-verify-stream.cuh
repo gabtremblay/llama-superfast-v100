@@ -72,14 +72,27 @@ static __device__ __forceinline__ float ex2(const float x) {
 }
 
 // 8 dims of a row: on F16 one 16-byte load at p; on Q8_0 p is the Q8_0 block and off (0, 8, 16, 24) the first of the 8 codes,
-// returned raw as {codes 0-3, codes 4-7, d, 0}
-template <bool Q8>
+// returned raw as {codes 0-3, codes 4-7, d, 0}. W (Q8_0 only): the codes as three 4-byte loads of the aligned 12-byte window
+// around them and two funnel shifts (they start 2 or 0 bytes past a 4-byte boundary: blocks are 34 bytes, rows 16-aligned),
+// instead of four 2-byte loads; the same code on every lane, no branch
+template <bool Q8, bool W = false>
 static __device__ __forceinline__ uint4 ld_row8(const char * p, const int off) {
     if constexpr (Q8) {
-        const unsigned short * qs = (const unsigned short *)(p + 2 + off);
-        const uint32_t lo = (uint32_t) __ldg(qs + 0) | ((uint32_t) __ldg(qs + 1) << 16);
-        const uint32_t hi = (uint32_t) __ldg(qs + 2) | ((uint32_t) __ldg(qs + 3) << 16);
-        return make_uint4(lo, hi, (uint32_t) __ldg((const unsigned short *) p), 0);
+        const uint32_t d = (uint32_t) __ldg((const unsigned short *) p);
+        if constexpr (W) {
+            const uintptr_t s = (uintptr_t)(p + 2 + off);
+            const uint32_t * w = (const uint32_t *)(s & ~(uintptr_t) 3);
+            const uint32_t sh = 8*(uint32_t)(s & 3);
+            // aligned codes need two words: the third load re-reads the second, so no load leaves the codes' own words
+            // (the last block of the last row ends the buffer on an aligned 8 codes)
+            const uint32_t w0 = __ldg(w + 0), w1 = __ldg(w + 1), w2 = __ldg(w + 1 + (sh != 0));
+            return make_uint4(__funnelshift_r(w0, w1, sh), __funnelshift_r(w1, w2, sh), d, 0);
+        } else {
+            const unsigned short * qs = (const unsigned short *)(p + 2 + off);
+            const uint32_t lo = (uint32_t) __ldg(qs + 0) | ((uint32_t) __ldg(qs + 1) << 16);
+            const uint32_t hi = (uint32_t) __ldg(qs + 2) | ((uint32_t) __ldg(qs + 3) << 16);
+            return make_uint4(lo, hi, d, 0);
+        }
     } else {
         (void) off;
         return __ldg((const uint4 *) p);
@@ -141,6 +154,7 @@ __global__ void __launch_bounds__(NTH, 1) verify_stream(
     const int qp   = (lane >> 2) & 3;
     const bool isQK = w < 4;
     constexpr int KP = VAR & 31, KQ = 16 - KP;
+    constexpr bool Q8W = (VAR & 32) != 0;   // VAR & 32: the Q8_0 codes as aligned-window loads (ld_row8)
 
     // this block's 8-token half; Q, the mask and the outputs from its first token on
     const int hf    = blockIdx.x % nhalf;
@@ -217,14 +231,14 @@ __global__ void __launch_bounds__(NTH, 1) verify_stream(
             {
                 const char * kp = Kbase + (int64_t)(it0*TK + w)*nbk1 + kofs;
 #pragma unroll
-                for (int rr = 0; rr < KQ; ++rr, kp += 4*nbk1) kreg[rr] = ld_row8<KVQ8>(kp, kq);
+                for (int rr = 0; rr < KQ; ++rr, kp += 4*nbk1) kreg[rr] = ld_row8<KVQ8, Q8W>(kp, kq);
             }
 #pragma unroll
             for (int rr = 0; rr < KQ; ++rr) *(uint4 *) &s.K[(4*rr + w)*KST + 8*lane] = to_f16x8<KVQ8>(kreg[rr]);
             if (nt > 1) {
                 const char * kp = Kbase + (int64_t)((it0 + 1)*TK + w)*nbk1 + kofs;
 #pragma unroll
-                for (int rr = 0; rr < KQ; ++rr, kp += 4*nbk1) kreg[rr] = ld_row8<KVQ8>(kp, kq);
+                for (int rr = 0; rr < KQ; ++rr, kp += 4*nbk1) kreg[rr] = ld_row8<KVQ8, Q8W>(kp, kq);
             }
         }
         __syncthreads();
@@ -347,7 +361,7 @@ __global__ void __launch_bounds__(NTH, 1) verify_stream(
                     if (KQ > 0 && j + 2 < nt) {
                         const char * kp = Kbase + (int64_t)((it0 + j + 2)*TK + w)*nbk1 + kofs;
 #pragma unroll
-                        for (int rr = 0; rr < KQ; ++rr, kp += 4*nbk1) kreg[rr] = ld_row8<KVQ8>(kp, kq);
+                        for (int rr = 0; rr < KQ; ++rr, kp += 4*nbk1) kreg[rr] = ld_row8<KVQ8, Q8W>(kp, kq);
                     }
                 }
             }
@@ -397,7 +411,7 @@ __global__ void __launch_bounds__(NTH, 1) verify_stream(
         if (nt > 0) {
             const char * vp = Vbase + (int64_t)(it0*TK)*nbv1;
 #pragma unroll
-            for (int q = 0; q < 16; ++q, vp += 4*nbv1) vreg[q] = ld_row8<KVQ8>(vp, vq);
+            for (int q = 0; q < 16; ++q, vp += 4*nbv1) vreg[q] = ld_row8<KVQ8, Q8W>(vp, vq);
         }
         if constexpr (KP > 0) {   // the PV group owns the last KP rows of the K tile's load and its store to shared memory
             const int wk = w & 3;
@@ -405,14 +419,14 @@ __global__ void __launch_bounds__(NTH, 1) verify_stream(
                 {
                     const char * kp = Kbase + (int64_t)(it0*TK + wk + 4*KQ)*nbk1 + kofs;
 #pragma unroll
-                    for (int rr = 0; rr < KP; ++rr, kp += 4*nbk1) kreg[rr] = ld_row8<KVQ8>(kp, kq);
+                    for (int rr = 0; rr < KP; ++rr, kp += 4*nbk1) kreg[rr] = ld_row8<KVQ8, Q8W>(kp, kq);
                 }
 #pragma unroll
                 for (int rr = 0; rr < KP; ++rr) *(uint4 *) &s.K[(4*(KQ + rr) + wk)*KST + 8*lane] = to_f16x8<KVQ8>(kreg[rr]);
                 if (nt > 1) {
                     const char * kp = Kbase + (int64_t)((it0 + 1)*TK + wk + 4*KQ)*nbk1 + kofs;
 #pragma unroll
-                    for (int rr = 0; rr < KP; ++rr, kp += 4*nbk1) kreg[rr] = ld_row8<KVQ8>(kp, kq);
+                    for (int rr = 0; rr < KP; ++rr, kp += 4*nbk1) kreg[rr] = ld_row8<KVQ8, Q8W>(kp, kq);
                 }
             }
         }
@@ -444,8 +458,8 @@ __global__ void __launch_bounds__(NTH, 1) verify_stream(
                 for (int c = 0; c < TK/8; ++c) {
                     const uint4 v0 = to_f16x8<KVQ8>(vreg[2*c]), v1 = to_f16x8<KVQ8>(vreg[2*c + 1]);
                     if (has_next) {
-                        vreg[2*c]     = ld_row8<KVQ8>(vp, vq);
-                        vreg[2*c + 1] = ld_row8<KVQ8>(vp + 4*nbv1, vq);
+                        vreg[2*c]     = ld_row8<KVQ8, Q8W>(vp, vq);
+                        vreg[2*c + 1] = ld_row8<KVQ8, Q8W>(vp + 4*nbv1, vq);
                     }
                     vp += 8*nbv1;
 #pragma unroll
@@ -468,7 +482,7 @@ __global__ void __launch_bounds__(NTH, 1) verify_stream(
                     if (j + 2 < nt) {
                         const char * kp = Kbase + (int64_t)((it0 + j + 2)*TK + wk + 4*KQ)*nbk1 + kofs;
 #pragma unroll
-                        for (int rr = 0; rr < KP; ++rr, kp += 4*nbk1) kreg[rr] = ld_row8<KVQ8>(kp, kq);
+                        for (int rr = 0; rr < KP; ++rr, kp += 4*nbk1) kreg[rr] = ld_row8<KVQ8, Q8W>(kp, kq);
                     }
                 }
             }

@@ -100,8 +100,10 @@ void ggml_cuda_flash_attn_ext_verify_stream(ggml_backend_cuda_context & ctx, ggm
     CUDA_SET_SHARED_MEMORY_LIMIT((fvs::verify_stream<6, false>),          nbytes_shared);
     CUDA_SET_SHARED_MEMORY_LIMIT((fvs::verify_stream<6, false, 8>),       nbytes_shared);
     CUDA_SET_SHARED_MEMORY_LIMIT((fvs::verify_stream<6, true>),           nbytes_shared);
-    CUDA_SET_SHARED_MEMORY_LIMIT((fvs::verify_stream<6, false, 0, true>), nbytes_shared);
-    CUDA_SET_SHARED_MEMORY_LIMIT((fvs::verify_stream<6, false, 8, true>), nbytes_shared);
+    CUDA_SET_SHARED_MEMORY_LIMIT((fvs::verify_stream<6, false,  0, true>), nbytes_shared);
+    CUDA_SET_SHARED_MEMORY_LIMIT((fvs::verify_stream<6, false,  8, true>), nbytes_shared);
+    CUDA_SET_SHARED_MEMORY_LIMIT((fvs::verify_stream<6, false, 32, true>), nbytes_shared);
+    CUDA_SET_SHARED_MEMORY_LIMIT((fvs::verify_stream<6, false, 40, true>), nbytes_shared);
     static int occ = [] {
         int o = 0;
         CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&o, kp8 ? fvs::verify_stream<6, false, 8> : fvs::verify_stream<6, false>, fvs::NTH, nbytes_shared));
@@ -136,9 +138,17 @@ void ggml_cuda_flash_attn_ext_verify_stream(ggml_backend_cuda_context & ctx, ggm
     }
 
     static const bool stub = [] { const char * e = getenv("LLAMA_FATTN_VERIFY_STREAM_STUB"); return e && atoi(e) != 0; }(); // ceiling probe, wrong output
-    // a Q8_0 cache has no stub variant: the probe is for the F16 data path
+    // a Q8_0 cache has no stub variant: the probe is for the F16 data path. Its K-row split between the warp groups is its own
+    // switch, since the widening moves work into whichever group stores the K rows: on Q8_0 the QK warps keep all of K (KP = 0;
+    // LLAMA_FATTN_VERIFY_STREAM_Q8_KP=8 gives the PV warps half, as on F16), and the codes load as aligned windows (ld_row8;
+    // LLAMA_FATTN_VERIFY_STREAM_Q8_W=0: four 2-byte loads). V100, 4 KV heads x gqa 6, 65,536 keys, 8 / 4 / 1 tokens:
+    // KP 8 + 2-byte 517 / 490 / 480 us, KP 0 + 2-byte 479 / 456 / 439, KP 8 + window 504 / 478 / 465, KP 0 + window 466 / 445 / 427
+    // (F16: 407 / 389 / 375)
+    static const bool q8_kp8 = [] { const char * e = getenv("LLAMA_FATTN_VERIFY_STREAM_Q8_KP"); return e && atoi(e) != 0; }();
+    static const bool q8_w   = [] { const char * e = getenv("LLAMA_FATTN_VERIFY_STREAM_Q8_W");  return !e || atoi(e) != 0; }();
     const bool kv_q8 = K->type == GGML_TYPE_Q8_0;
-    (kv_q8 ? (kp8 ? fvs::verify_stream<6, false, 8, true> : fvs::verify_stream<6, false, 0, true>) :
+    (kv_q8 ? (q8_w ? (q8_kp8 ? fvs::verify_stream<6, false, 40, true> : fvs::verify_stream<6, false, 32, true>)
+                   : (q8_kp8 ? fvs::verify_stream<6, false,  8, true> : fvs::verify_stream<6, false,  0, true>)) :
      stub  ? fvs::verify_stream<6, true> : kp8 ? fvs::verify_stream<6, false, 8> : fvs::verify_stream<6, false>)<<<dim3(nsplit*nkvh*nhalf, n_strm, 1), fvs::NTH, nbytes_shared, stream>>>(
         (const float *) Q->data, (const char *) K->data, (const char *) V->data, (const char *) mask->data,
         (float *) dst->data, parts.ptr, meta.ptr, n_tok, n_head, nkvh,
