@@ -1258,19 +1258,22 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             llama_set_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k], true);
         }
 
-        // [TAG_DFLASH2_FEAT_DEV] LLAMA_DFLASH2_FEAT_DEV (default 1): a verify-sized target decode (one ubatch of at most
-        // 64 rows) keeps its layer inputs on the device, and the injection copies them device to device on the GPU's streams, instead
-        // of device -> host -> device with a wait; larger decodes (prefill) still go through the host. The device path takes the
-        // layers in ascending order, as the host path's slots are, so it needs ascending target_layer_ids
+        // [TAG_DFLASH2_FEAT_DEV] LLAMA_DFLASH2_FEAT_DEV (default 1): a target decode that is one ubatch keeps its layer inputs on
+        // the device, and the injection copies the rows it takes device to device on the GPU's streams, instead of device -> host ->
+        // device with a wait (the eGPU link). That covers the verifies and, with --batch-size equal to --ubatch-size, every prefill
+        // batch; a decode of several ubatches still goes through the host. LLAMA_DFLASH2_FEAT_DEV_ROWS caps the rows held so (default
+        // the target's ubatch). The device path takes the layers in ascending order, as the host path's slots are, so it needs
+        // ascending target_layer_ids
         {
             const char * e = getenv("LLAMA_DFLASH2_FEAT_DEV");
+            const char * r = getenv("LLAMA_DFLASH2_FEAT_DEV_ROWS");
             bool ascending = true;
             for (uint32_t k = 1; k < target_layer_ids_n; ++k) {
                 ascending = ascending && target_layer_ids[k] > target_layer_ids[k - 1];
             }
-            feat_dev = is_dflash2 && ascending && (e == nullptr || atoi(e) != 0) && n_seq == 1;
+            feat_dev = is_dflash2 && ascending && (e == nullptr || atoi(e) != 0);
             if (feat_dev) {
-                llama_set_embeddings_layer_inp_dev(ctx_tgt, 64);
+                llama_set_embeddings_layer_inp_dev(ctx_tgt, r ? atoi(r) : (int32_t) llama_n_ubatch(ctx_tgt));
             }
         }
 
@@ -1399,8 +1402,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         const int32_t n_ubatch = (int32_t) llama_n_ubatch(ctx_dft);
 
-        // [TAG_DFLASH2_FEAT_DEV] the target held this decode's layer inputs on the device (a verify): the one sequence's
-        // rows, all of them, go to the injection device to device. Otherwise they are read back from the host copies
+        // [TAG_DFLASH2_FEAT_DEV] the target held this decode's layer inputs on the device: the rows each sequence injects go
+        // device to device (llama_set_embeddings_layer_inp_dev_select). Otherwise they are read back from the host copies
         const int32_t n_dev = feat_dev ? llama_get_embeddings_layer_inp_dev_rows(ctx_tgt) : 0;
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
@@ -1417,16 +1420,15 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             }
 
             // [TAG_DFLASH2_FEAT_DEV] the target held this decode's features on the device only (no host copy): the injection takes
-            // all its rows from there. It does so only for one sequence's small batch (feat_dev needs n_seq == 1)
+            // its rows from there
             const bool dev = n_dev > 0;
-            GGML_ASSERT(!dev || (n_dev == n_tokens && n_rows == n_tokens && n_rows <= n_ubatch));
+            GGML_ASSERT(!dev || n_dev == n_tokens);
 
-            // the rows a later draft can see (inject_row), in batch order; with the device path every row (a small
-            // prefill batch ends at a checkpoint mark or at the prompt's end, so its rows are within the window anyway)
+            // the rows a later draft can see (inject_row), in batch order
             std::vector<int32_t> rows;
             rows.reserve(n_rows);
             for (int32_t r = i_batch_beg[seq_id]; r <= i_batch_end[seq_id]; ++r) {
-                if (dev || inject_row(seq_id, batch_in.pos[r])) {
+                if (inject_row(seq_id, batch_in.pos[r])) {
                     rows.push_back(r);
                 }
             }
@@ -1472,11 +1474,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     batch_inject.logits[i]    = false;
                 }
                 if (dev) {
+                    llama_set_embeddings_layer_inp_dev_select(ctx_tgt, rows.data() + offset, n_chunk);
                     llama_set_inject_dev(ctx_dft, true);
                 }
                 const int32_t rc = llama_decode(ctx_dft, batch_inject);
                 if (dev) {
                     llama_set_inject_dev(ctx_dft, false);
+                    llama_set_embeddings_layer_inp_dev_select(ctx_tgt, nullptr, 0);
                 }
                 if (rc != 0) {
                     LOG_ERR("%s: llama_decode(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",

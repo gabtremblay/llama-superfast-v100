@@ -334,11 +334,15 @@ struct server_slot {
 
     server_prompt prompt;
 
-    bool prompt_save(server_prompt_cache & prompt_cache) const {
+    // next: the prompt about to replace this slot's (nullptr: none). Checkpoints that cover tokens past its common prefix
+    // with the slot's prompt are of no further use to the slot, so they are moved into the cache entry rather than copied
+    // (a 27B hybrid checkpoint is ~150 MiB; two copies were most of a ~300 ms save); the rest are copied
+    bool prompt_save(server_prompt_cache & prompt_cache, const server_tokens * next = nullptr) {
         if (prompt.tokens.size() == 0) {
             return false;
         }
 
+        const int64_t t0 = ggml_time_us();
         const size_t cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         const size_t cur_size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
 
@@ -358,12 +362,32 @@ struct server_slot {
         if (cur == nullptr) {
             return false;
         }
+        const int64_t t1 = ggml_time_us();
 
         llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         if (ctx_dft) {
             llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         }
         cur->data.spec = std::move(cur_spec);
+        const int64_t t2 = ggml_time_us();
+
+        const int64_t lcp = next ? (int64_t) prompt.tokens.get_common_prefix(*next) : -1;
+        size_t n_moved = 0;
+        for (auto it = prompt.checkpoints.begin(); it != prompt.checkpoints.end();) {
+            if (next && it->n_tokens > lcp) {
+                auto nx = std::next(it);
+                cur->prompt.checkpoints.splice(cur->prompt.checkpoints.end(), prompt.checkpoints, it);
+                it = nx;
+                ++n_moved;
+            } else {
+                cur->prompt.checkpoints.push_back(*it);
+                ++it;
+            }
+        }
+
+        SRV_TRC(" - prompt saved: alloc %.1f ms, state %.1f ms (%.1f MiB), checkpoints %.1f ms (%zu moved, %zu copied)\n",
+                (t1 - t0) / 1e3, (t2 - t1) / 1e3, cur_size / 1048576.0, (ggml_time_us() - t2) / 1e3,
+                n_moved, cur->prompt.checkpoints.size() - n_moved);
 
         return true;
     }
@@ -2140,7 +2164,7 @@ private:
 
                 const int64_t t_start = ggml_time_us();
 
-                ret->prompt_save(*prompt_cache);
+                ret->prompt_save(*prompt_cache, &task.tokens);
 
                 if (!ret->prompt_load(*prompt_cache, task.tokens)) {
                     ret->prompt_clear();
@@ -2854,6 +2878,30 @@ private:
         GGML_ASSERT(!(tu_job.active && tu_job.slot == &slot) && "a checkpoint of a live prompt job's sequence");
         const int id_task = slot.task->id;
 
+        // a checkpoint already at this n_tokens holds the same state: the checkpoints past the prompt's common prefix were
+        // erased when it was loaded, so it covers the same tokens. It is kept (now the current task's) unless it lacks the
+        // speculative state this one would have: re-creating it cost a copy of the whole state over the link each time a
+        // restored checkpoint's mark came up again (the shared system prompt of every new conversation).
+        // LLAMA_CKPT_KEEP_SAME=0: superseded, as before
+        static const bool keep_same = [] { const char * e = getenv("LLAMA_CKPT_KEEP_SAME"); return e == nullptr || atoi(e) != 0; }();
+        if (keep_same) {
+            const int64_t n_tokens_new = slot.prompt.n_tokens() - n_tokens_cur;
+            for (auto & ck : slot.prompt.checkpoints) {
+                if (ck.n_tokens != n_tokens_new) {
+                    continue;
+                }
+                std::vector<uint8_t> sp;
+                if (ck.data_spec.empty() && common_speculative_state_valid(spec.get(), slot.id, slot.prompt.tokens.pos_next(ck.n_tokens))) {
+                    common_speculative_get_state(spec.get(), slot.id, sp);
+                }
+                if (sp.empty()) {
+                    ck.id_task = id_task;
+                    SLT_TRC(slot, "keeping context checkpoint at n_tokens = %" PRId64 " (the same state)\n", ck.n_tokens);
+                    return;
+                }
+            }
+        }
+
         // evict checkpoints within min-step of a previous checkpoint, unless they were
         // created by the current task
         // only when the list is full, otherwise short prompts keep just the oldest checkpoint
@@ -2911,12 +2959,14 @@ private:
             const char * e = getenv("LLAMA_CKPT_ASYNC");
             return !(e && atoi(e) == 0);
         }();
+        // the draft's state first (synchronous, a few MiB): queued after the target's copy over the link it waited for it, ~50 ms
+        // of host time per checkpoint with the target's copy staged off the compute stream (TAG_CKPT_STAGE)
         const int64_t t_ck0 = ggml_time_us();
-        cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | (ckpt_async ? LLAMA_STATE_SEQ_FLAGS_ASYNC : 0));
-        const int64_t t_ck1 = ggml_time_us();
         if (!ckpt_dft_skip) {
             cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         }
+        const int64_t t_ck1 = ggml_time_us();
+        cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | (ckpt_async ? LLAMA_STATE_SEQ_FLAGS_ASYNC : 0));
         const int64_t t_ck2 = ggml_time_us();
         // stash the draft's speculative state with the checkpoint
         // the checkpoint holds the state before its queued batch: the speculative state must be the one for its
@@ -2927,7 +2977,7 @@ private:
             SLT_WRN(slot, "checkpoint at n_tokens = %" PRId64 " stored without the speculative state: none for its last token\n", cur.n_tokens);
         }
         if (getenv("LLAMA_CKPT_TIMERS")) {
-            fprintf(stderr, "ckpt-timer: tgt %.1f ms (%zu B) dft %.1f ms (%zu B) spec %.1f ms\n", (t_ck1 - t_ck0)/1e3, cur.data_tgt.size(), (t_ck2 - t_ck1)/1e3, cur.data_dft.size(), (ggml_time_us() - t_ck2)/1e3);
+            fprintf(stderr, "ckpt-timer: dft %.1f ms (%zu B) tgt %.1f ms (%zu B) spec %.1f ms\n", (t_ck1 - t_ck0)/1e3, cur.data_dft.size(), (t_ck2 - t_ck1)/1e3, cur.data_tgt.size(), (ggml_time_us() - t_ck2)/1e3);
         }
 
         SLT_TRC(slot,
@@ -5106,10 +5156,19 @@ private:
         // when tu_policy.fix is active, a multi-ubatch read (> tu_peer_rows when idle, > 8 when decoding)
         // runs as a sliced job so arriving warm or shorter requests are admitted within one slice, while 1-token warm
         // prompts co-batch directly without an extra job pass
+        // with no slot generating, a read that one forward pass covers runs directly: as a sliced job it paid ~80 ms per
+        // slice in host overhead (a 102-token prompt: 7 slices, ~490 ms, against ~85 ms direct) for an admission point a
+        // newcomer gains little from. Above LLAMA_TU_IDLE_JOB_MIN rows (default 512, ~0.6 s of prefill on a V100) it is
+        // still sliced; 0 restores tu_peer_rows
+        static const int32_t idle_job_min = [] {
+            const char * e = getenv("LLAMA_TU_IDLE_JOB_MIN");
+            return e ? atoi(e) : 512;
+        }();
+        const int32_t idle_rows = std::max<int32_t>(tu_peer_rows, idle_job_min);
         const bool tu_fill = tu_engaged && !tu_job.active && tu_pick != nullptr &&
             (tu_policy.force ||
              (tu_policy.fix
-                 ? (tu_remaining(*tu_pick) > (generating.empty() ? tu_peer_rows : 8))
+                 ? (tu_remaining(*tu_pick) > (generating.empty() ? idle_rows : 8))
                  : !generating.empty()));
 
         // a reader's batch alone while a job lives (tu_read_other): its own limit

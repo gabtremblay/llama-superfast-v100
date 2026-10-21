@@ -650,7 +650,9 @@ struct server_prompt_cache {
 
     size_t n_tokens() const;
 
-    // state_size_spec: the bytes of the entry's speculative state, counted against the limit (the caller fills data.spec)
+    // state_size_spec: the bytes of the entry's speculative state, counted against the limit (the caller fills data.spec).
+    // prompt.checkpoints are counted against the limit too, but the entry is returned without them: the caller fills
+    // prompt.checkpoints
     server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft, size_t state_size_spec = 0);
 
     // loaded: whether an entry replaced the slot's state; spec: that entry's speculative state (empty: none)

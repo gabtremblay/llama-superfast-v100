@@ -1749,18 +1749,28 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         }
     }
 
+    // the state buffers of the entries removed to make room are reused for the new entry: a fresh vector of the size
+    // (150+ MiB) paid its page faults and zero fill on every save once the cache was full (~250 ms with the checkpoint
+    // copies, on a 27B hybrid model's 160 MiB state)
+    std::vector<uint8_t> state_data_tgt;
+    std::vector<uint8_t> state_data_dft;
+
     if (limit_size > 0) {
         // make room before allocating the new vectors to avoid breaching the limit
         while (!states.empty() && size() + state_size_new > limit_size) {
             SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
                     states.front().size() / (1024.0 * 1024.0));
 
+            auto & old = states.front().data;
+            if (old.main.capacity() > state_data_tgt.capacity()) {
+                state_data_tgt = std::move(old.main);
+            }
+            if (old.drft.capacity() > state_data_dft.capacity()) {
+                state_data_dft = std::move(old.drft);
+            }
             states.pop_front();
         }
     }
-
-    std::vector<uint8_t> state_data_tgt;
-    std::vector<uint8_t> state_data_dft;
 
     // check if we can allocate enough memory for the new state
     try {
@@ -1778,10 +1788,12 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         return nullptr;
     }
 
+    // the entry's checkpoints are filled by the caller (server_slot::prompt_save), which moves the ones its slot can no
+    // longer use instead of copying them
     states.push_back({
         /*.prompt =*/ {
             /*.tokens      =*/ prompt.tokens.clone(),
-            /*.checkpoints =*/ prompt.checkpoints,
+            /*.checkpoints =*/ {},
         },
         /*.data   =*/ {
             /*.main =*/ std::move(state_data_tgt),

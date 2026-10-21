@@ -40,6 +40,14 @@ struct llama_memory_buffer {
 
 using llama_memory_buffers = std::map<ggml_backend_buffer_type_t, llama_memory_buffer>;
 
+// one tensor slice of a state get (llama_io_write_host_async), to land at ptr
+struct llama_state_write_info {
+    ggml_tensor * tensor;
+    uint8_t * ptr;
+    size_t size;
+    size_t offset;
+};
+
 struct llama_context {
     // init scheduler and compute buffers, reserve worst-case graphs
     llama_context(
@@ -124,8 +132,11 @@ struct llama_context {
     void    set_embeddings_layer_inp_dev(int32_t n_rows_max);
     int32_t get_embeddings_layer_inp_dev_rows() const { return layer_inp_dev_n; }
     void    set_inject_dev(bool value) { cparams.inject_dev = value; }
-    // copies the device-held input of the slot-th enabled layer (ascending layer order) into dst at byte offset dst_offs, on this
-    // context's stream, and makes backend_dst's stream wait for it (ggml_backend_tensor_copy_async); false if not held
+    // the rows of the last decode the next copy_layer_inp_dev hands out, in order (empty: all of them)
+    void    set_layer_inp_dev_select(const int32_t * rows, int32_t n) { layer_inp_dev_sel.assign(rows, rows + std::max<int32_t>(0, n)); }
+    // copies the device-held input of the slot-th enabled layer (ascending layer order), the selected rows, into dst at byte offset
+    // dst_offs (one run of consecutive rows per copy), on this context's stream, and makes backend_dst's stream wait for it
+    // (ggml_backend_tensor_copy_async); false if not held
     bool    copy_layer_inp_dev(uint32_t slot, const ggml_tensor * dst, size_t dst_offs, ggml_backend_t backend_dst) const;
     void set_nextn_layer_offset(int32_t offset);
     void set_causal_attn(bool value);
@@ -170,6 +181,9 @@ struct llama_context {
 
     // waits for the copies queued by state_seq_get_data with LLAMA_STATE_SEQ_FLAGS_ASYNC
     void state_seq_wait();
+
+    // [TAG_CKPT_STAGE] queues an async state get's tensor writes through the staging buffer; false: not staged, nothing queued
+    bool state_stage_writes(const std::vector<llama_state_write_info> & writes, const std::vector<ggml_backend_t> & cands);
 
     bool state_load_file(
             const char * filepath,
@@ -364,6 +378,7 @@ private:
     std::vector<ggml_tensor *> layer_inp_dev_t;
     ggml_backend_t             layer_inp_dev_backend = nullptr;
     int32_t                    layer_inp_dev_n = 0;
+    std::vector<int32_t>       layer_inp_dev_sel; // set_layer_inp_dev_select
 
     struct sampling_info {
         // !samplers.empty() to check if any samplers are active
@@ -589,6 +604,17 @@ private:
     std::vector<ggml_backend_t>       state_async_be;
     std::vector<ggml_backend_event_t> state_async_ev;
     std::vector<bool>                 state_async_set;
+
+    // [TAG_CKPT_STAGE] an async state get whose tensors all sit on one GPU: copied device to device into stage_buf on that GPU's
+    // stream, then to the host on a second backend of the same device (stage_be, its own stream), so the compute that follows
+    // does not queue behind the copy over the link. stage_ev_main: the device copies are done; stage_ev_copy: the host copies
+    // are (the next stage waits on it on the device before it overwrites stage_buf)
+    ggml_backend_t        stage_be      = nullptr;
+    ggml_backend_buffer_t stage_buf     = nullptr;
+    ggml_backend_event_t  stage_ev_main = nullptr;
+    ggml_backend_event_t  stage_ev_copy = nullptr;
+    bool                  stage_pending = false;
+    bool                  stage_off     = false; // set once staging is found unavailable
 
     // training
     ggml_opt_context_t opt_ctx = nullptr;

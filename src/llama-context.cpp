@@ -571,6 +571,10 @@ llama_context::~llama_context() {
             ev = nullptr;
         }
     }
+    if (stage_ev_main) { ggml_backend_event_free(stage_ev_main); stage_ev_main = nullptr; }
+    if (stage_ev_copy) { ggml_backend_event_free(stage_ev_copy); stage_ev_copy = nullptr; }
+    if (stage_buf)     { ggml_backend_buffer_free(stage_buf);    stage_buf     = nullptr; }
+    if (stage_be)      { ggml_backend_free(stage_be);            stage_be      = nullptr; }
 
     for (auto & ev : pipe_ev) {
         if (ev) {
@@ -1370,19 +1374,32 @@ bool llama_context::copy_layer_inp_dev(uint32_t slot, const ggml_tensor * dst, s
     if (layer_inp_dev_n <= 0 || slot >= layer_inp_dev_t.size() || layer_inp_dev_backend == nullptr || dst == nullptr || dst->data == nullptr) {
         return false;
     }
-    const ggml_tensor * src = layer_inp_dev_t[slot];
-    // dst's slice for this slot: the same shape as src, contiguous, at dst_offs
-    ggml_tensor d = *dst;
-    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
-        d.ne[i] = src->ne[i];
-        d.nb[i] = src->nb[i];
-    }
-    if (d.type != src->type || !ggml_is_contiguous(src) || dst_offs + ggml_nbytes(src) > ggml_nbytes(dst)) {
+    ggml_tensor * src = layer_inp_dev_t[slot];
+    // dst's slice for this slot: [n_embd, n_rows], contiguous, at dst_offs; n_rows = the selection's size, or all of src's rows
+    const int64_t n_rows = layer_inp_dev_sel.empty() ? src->ne[1] : (int64_t) layer_inp_dev_sel.size();
+    if (dst->type != src->type || !ggml_is_contiguous(src) || src->ne[2] != 1 || src->ne[3] != 1 || dst->ne[0] != src->ne[0] || dst->ne[1] != n_rows ||
+            dst_offs + n_rows*src->nb[1] > ggml_nbytes(dst)) {
         return false;
     }
-    d.data     = (char *) dst->data + dst_offs;
-    d.view_src = dst->view_src ? dst->view_src : const_cast<ggml_tensor *>(dst);
-    ggml_backend_tensor_copy_async(layer_inp_dev_backend, backend_dst, src, &d);
+    for (int64_t i = 0; i < n_rows; ) {
+        const int64_t r0 = layer_inp_dev_sel.empty() ? i : layer_inp_dev_sel[i];
+        int64_t n = 1;
+        while (i + n < n_rows && (layer_inp_dev_sel.empty() || layer_inp_dev_sel[i + n] == r0 + n)) {
+            ++n;
+        }
+        GGML_ASSERT(r0 >= 0 && r0 + n <= src->ne[1]);
+        ggml_tensor s = *src;
+        ggml_tensor d = *src;
+        s.ne[1]    = n;
+        s.data     = (char *) src->data + r0*src->nb[1];
+        s.view_src = src->view_src ? src->view_src : src;
+        d.ne[1]    = n;
+        d.data     = (char *) dst->data + dst_offs + i*src->nb[1];
+        d.buffer   = dst->buffer;
+        d.view_src = dst->view_src ? dst->view_src : const_cast<ggml_tensor *>(dst);
+        ggml_backend_tensor_copy_async(layer_inp_dev_backend, backend_dst, &s, &d);
+        i += n;
+    }
     return true;
 }
 
@@ -4171,6 +4188,16 @@ public:
             uint8_t * p, size_t len, const std::vector<ggml_backend_t> & cands, std::vector<ggml_backend_t> & used)
         : ptr(p), buf_size(len), cands(cands), used(used) {}
 
+    using write_info = llama_state_write_info;
+
+    // [TAG_CKPT_STAGE] the tensor writes, for the caller to queue itself instead of the destructor (or to hand back)
+    std::vector<write_info> take_writes() {
+        return std::move(winfos);
+    }
+    void write_tensor_deferred(const write_info & w) {
+        winfos.push_back(w);
+    }
+
     ~llama_io_write_host_async() {
         for (const auto & winfo : winfos) {
             ggml_backend_buffer_t buf = winfo.tensor->view_src ? winfo.tensor->view_src->buffer : winfo.tensor->buffer;
@@ -4229,12 +4256,6 @@ private:
     const std::vector<ggml_backend_t> & cands;
     std::vector<ggml_backend_t> & used;
 
-    struct write_info {
-        ggml_tensor * tensor;
-        uint8_t * ptr;
-        size_t size;
-        size_t offset;
-    };
     std::vector<write_info> winfos;
 };
 
@@ -4709,6 +4730,15 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
                 LLAMA_LOG_ERROR("%s: error saving state: %s\n", __func__, err.what());
                 n = 0;
             }
+            if (n > 0) {
+                auto writes = io.take_writes();
+                if (!state_stage_writes(writes, cands)) {
+                    // not staged: the destructor queues them on the compute streams, as before
+                    for (auto & w : writes) {
+                        io.write_tensor_deferred(w);
+                    }
+                }
+            }
         }
         for (ggml_backend_t be : used) {
             size_t i = 0;
@@ -4748,7 +4778,103 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
     }
 }
 
+// [TAG_CKPT_STAGE] LLAMA_CKPT_STAGE (default 1): see llama_context::stage_be. Returns false (nothing queued) when the writes are
+// not all on one GPU backend's buffers or the staging resources cannot be had; the caller then queues them as before
+bool llama_context::state_stage_writes(const std::vector<llama_state_write_info> & writes, const std::vector<ggml_backend_t> & cands) {
+    static const bool on = [] { const char * e = getenv("LLAMA_CKPT_STAGE"); return e == nullptr || atoi(e) != 0; }();
+    if (!on || stage_off || writes.empty()) {
+        return false;
+    }
+    ggml_backend_t be = nullptr;
+    size_t total = 0;
+    for (const auto & w : writes) {
+        ggml_backend_buffer_t buf = w.tensor->view_src ? w.tensor->view_src->buffer : w.tensor->buffer;
+        if (ggml_backend_buffer_is_host(buf)) {
+            return false;
+        }
+        ggml_backend_t b = nullptr;
+        for (ggml_backend_t c : cands) {
+            if (ggml_backend_supports_buft(c, ggml_backend_buffer_get_type(buf))) {
+                b = c;
+                break;
+            }
+        }
+        if (b == nullptr || (be != nullptr && b != be)) {
+            return false;
+        }
+        be = b;
+        total += GGML_PAD(w.size, 256);
+    }
+    ggml_backend_dev_t dev = ggml_backend_get_device(be);
+    if (stage_be == nullptr) {
+        stage_be      = ggml_backend_dev_init(dev, nullptr);
+        stage_ev_main = ggml_backend_event_new(dev);
+        stage_ev_copy = ggml_backend_event_new(dev);
+        if (stage_be == nullptr || stage_ev_main == nullptr || stage_ev_copy == nullptr) {
+            LLAMA_LOG_WARN("%s: state staging unavailable on %s, async state copies stay on the compute stream\n", __func__, ggml_backend_dev_name(dev));
+            stage_off = true;
+            return false;
+        }
+    }
+    if (ggml_backend_get_device(stage_be) != dev) {
+        return false;
+    }
+    // the previous stage's host copies read stage_buf: the compute stream waits for them before overwriting it
+    if (stage_pending) {
+        ggml_backend_event_wait(be, stage_ev_copy);
+    }
+    if (stage_buf == nullptr || ggml_backend_buffer_get_size(stage_buf) < total) {
+        if (stage_buf) {
+            ggml_backend_event_synchronize(stage_ev_copy);
+            ggml_backend_buffer_free(stage_buf);
+            stage_buf = nullptr;
+        }
+        stage_buf = ggml_backend_buft_alloc_buffer(ggml_backend_get_default_buffer_type(be), total);
+        if (stage_buf == nullptr) {
+            LLAMA_LOG_WARN("%s: no %.1f MiB staging buffer on %s, async state copies stay on the compute stream\n", __func__, total/1024.0/1024.0, ggml_backend_dev_name(dev));
+            stage_off = true;
+            return false;
+        }
+        LLAMA_LOG_INFO("%s: state staging buffer %.1f MiB on %s\n", __func__, total/1024.0/1024.0, ggml_backend_dev_name(dev));
+    }
+    char * base = (char *) ggml_backend_buffer_get_base(stage_buf);
+
+    // byte views: one per write, of its source and of its place in stage_buf
+    auto bytes = [](ggml_backend_buffer_t buf, void * data, size_t n) {
+        ggml_tensor t = {};
+        t.type   = GGML_TYPE_I8;
+        t.buffer = buf;
+        t.data   = data;
+        t.ne[0] = (int64_t) n; t.ne[1] = t.ne[2] = t.ne[3] = 1;
+        t.nb[0] = 1; t.nb[1] = n; t.nb[2] = n; t.nb[3] = n;
+        return t;
+    };
+    size_t off = 0;
+    for (const auto & w : writes) {
+        ggml_backend_buffer_t buf = w.tensor->view_src ? w.tensor->view_src->buffer : w.tensor->buffer;
+        ggml_tensor src = bytes(buf, (char *) w.tensor->data + w.offset, w.size);
+        ggml_tensor dst = bytes(stage_buf, base + off, w.size);
+        ggml_backend_tensor_copy_async(be, be, &src, &dst);
+        off += GGML_PAD(w.size, 256);
+    }
+    ggml_backend_event_record(stage_ev_main, be);
+    ggml_backend_event_wait(stage_be, stage_ev_main);
+    off = 0;
+    for (const auto & w : writes) {
+        ggml_tensor st = bytes(stage_buf, base + off, w.size);
+        ggml_backend_tensor_get_async(stage_be, &st, w.ptr, 0, w.size);
+        off += GGML_PAD(w.size, 256);
+    }
+    ggml_backend_event_record(stage_ev_copy, stage_be);
+    stage_pending = true;
+    return true;
+}
+
 void llama_context::state_seq_wait() {
+    if (stage_pending) {
+        ggml_backend_event_synchronize(stage_ev_copy);
+        stage_pending = false;
+    }
     for (size_t i = 0; i < state_async_ev.size(); ++i) {
         if (state_async_set[i]) {
             ggml_backend_event_synchronize(state_async_ev[i]);
@@ -5671,6 +5797,10 @@ int32_t llama_get_embeddings_layer_inp_dev_rows(llama_context * ctx) {
 
 void llama_set_inject_dev(llama_context * ctx, bool value) {
     ctx->set_inject_dev(value);
+}
+
+void llama_set_embeddings_layer_inp_dev_select(llama_context * ctx, const int32_t * rows, int32_t n) {
+    ctx->set_layer_inp_dev_select(rows, n);
 }
 
 void llama_set_nextn_layer_offset(llama_context * ctx, int32_t offset) {

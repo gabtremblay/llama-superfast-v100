@@ -122,6 +122,9 @@ LLAMA_API int32_t llama_get_embeddings_layer_inp_dev_rows(struct llama_context *
 // ... and a DFlash2 draft's next embd decodes take their features from its ctx_other's device-held layer inputs (the batch's embd
 // rows are then not read) while this is set
 LLAMA_API void    llama_set_inject_dev(struct llama_context * ctx, bool value);
+// ... which of the target's device-held rows those decodes take, in order, one per embd row (n = 0: all of them, the batch is
+// the whole decode); set on the target
+LLAMA_API void    llama_set_embeddings_layer_inp_dev_select(struct llama_context * ctx, const int32_t * rows, int32_t n);
 
 LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 

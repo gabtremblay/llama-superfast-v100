@@ -13,7 +13,8 @@ public:
     virtual ~llm_graph_input_dflash_feat() = default;
 
     void set_input(const llama_ubatch * ubatch) override {
-        GGML_ASSERT(src->get_embeddings_layer_inp_dev_rows() == (int32_t) ubatch->n_tokens && "the target holds no device features for this batch");
+        GGML_ASSERT(src->get_embeddings_layer_inp_dev_rows() > 0 && "the target holds no device features for this batch");
+        GGML_ASSERT(feat->ne[1] == (int64_t) ubatch->n_tokens);
         ggml_backend_t be = ggml_backend_sched_get_tensor_backend(sched, feat);
         for (int64_t k = 0; k < feat->ne[2]; ++k) {
             GGML_ASSERT(src->copy_layer_inp_dev((uint32_t) k, feat, (size_t) k * feat->nb[2], be));
