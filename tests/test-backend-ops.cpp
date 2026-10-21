@@ -12667,6 +12667,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    // the 27B's FFN products (5120 -> 17408 up/gate, 17408 -> 5120 down) from decode through the small prompt batches
+    // a chat turn sends (9 to a few hundred tokens) up to a micro-batch
+    // (F16: the cuBLAS product alone, against which the quantized types' expansion to fp16 shows at 256 tokens and up)
+    for (ggml_type t : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_F16}) {
+        for (auto mk : {std::pair<int64_t, int64_t>{17408, 5120}, {5120, 17408}}) {
+            for (int n : {1, 8, 16, 32, 64, 96, 128, 160, 192, 224, 256, 512, 2048}) {
+                test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, mk.first, n, mk.second, {1, 1}, {1, 1}));
+            }
+        }
+    }
+
     // Flash-Next's expert products (512 experts, 10 used; gate/up 2560 -> 640 broadcast, down 640 -> 2560)
     for (ggml_type t : {GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S}) {
         for (int n : {512, 1024, 2048, 4096}) {

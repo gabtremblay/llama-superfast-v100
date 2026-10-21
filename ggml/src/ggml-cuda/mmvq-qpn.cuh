@@ -17,13 +17,15 @@
 #define GGML_CUDA_QPN_ALL    (GGML_CUDA_QPN_Q5_K | GGML_CUDA_QPN_Q4_K | GGML_CUDA_QPN_Q6_K | GGML_CUDA_QPN_IQ4_XS | GGML_CUDA_QPN_IQ4_NL | \
                               GGML_CUDA_QPN_Q3_K | GGML_CUDA_QPN_Q8_0)
 
-// products of at most this many tokens run the tensor-core kernel (in passes of 16); larger ones dequantize to fp16 for cuBLAS
-// (LLAMA_QPN_MAX_TOKENS=32 restores the old route, at most 64)
-#define GGML_CUDA_QPN_MAX_TOKENS 64
+// products of at most ggml_cuda_qpn_max_tokens() tokens run the tensor-core kernel (in passes of 16, each a read of the
+// weights); larger ones go to MMQ on the unrepacked weight or dequantize to fp16 for cuBLAS. LLAMA_QPN_MAX_TOKENS sets it, at
+// most GGML_CUDA_QPN_MAX_TOKENS (32 restores the old route); default GGML_CUDA_QPN_DEF_TOKENS
+#define GGML_CUDA_QPN_MAX_TOKENS 256
+#define GGML_CUDA_QPN_DEF_TOKENS 128
 static inline int ggml_cuda_qpn_max_tokens() {
     static const int n = [] {
         const char * e = getenv("LLAMA_QPN_MAX_TOKENS");
-        const int v = e ? atoi(e) : GGML_CUDA_QPN_MAX_TOKENS;
+        const int v = e ? atoi(e) : GGML_CUDA_QPN_DEF_TOKENS;
         return v < 1 ? 1 : v > GGML_CUDA_QPN_MAX_TOKENS ? GGML_CUDA_QPN_MAX_TOKENS : v;
     }();
     return n;
@@ -77,8 +79,18 @@ bool ggml_backend_cuda_qpn_unpack(const ggml_tensor * t, void * host_dst);
 // y = W x for a repacked W and 1..GGML_CUDA_QPN_MAX_TOKENS tokens
 void ggml_cuda_mul_mat_qpn(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
 
-// the whole repacked W as fp16, row-major, the same values ggml's to_fp16 gives for the GGUF layout (prefill path)
-void ggml_cuda_qpn_to_fp16(const ggml_tensor * src0, half * dst, cudaStream_t stream);
+// the whole repacked W as fp16, row-major, the same values ggml's to_fp16 gives for the GGUF layout (prefill path).
+// check_dst (LLAMA_QPN_EXPAND_CHECK, ggml_cuda_qpn_check_enabled): as large again; the earlier kernel's output goes there and
+// the two are compared on the device
+void ggml_cuda_qpn_to_fp16(const ggml_tensor * src0, half * dst, cudaStream_t stream, half * check_dst = nullptr);
+
+// the GGUF bytes of a whole repacked t (not a view) into dst, ggml_nbytes(t) of device memory, on stream; false if t is not
+// such a tensor or its type has no unrepack. For MMQ on a repacked weight (ggml_cuda_mul_mat, past the tensor-core kernel).
+// check_dst as for ggml_cuda_qpn_to_fp16
+bool ggml_cuda_qpn_unpack_device(const ggml_tensor * t, void * dst, cudaStream_t stream, void * check_dst = nullptr);
+
+// LLAMA_QPN_EXPAND_CHECK=1: the callers above pass a check buffer
+bool ggml_cuda_qpn_check_enabled();
 
 // bytes of one pass's prepared input (fp16 fragments, per-32 sums, range scales) for K columns and T <= 8
 // tokens; products of one pass that read the same input share it (ggml_cuda_plan_q8_share, LLAMA_QPN_SHARE)

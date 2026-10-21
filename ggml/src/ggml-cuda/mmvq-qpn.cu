@@ -401,6 +401,146 @@ static __device__ __forceinline__ void qpn_load_row(const char * tsb, const int 
     tl = qpn_load_tail<type>(tsb, lane);
 }
 
+// the 32 values of sub-block s (columns 32s..32s+31) of one GGUF block, each computed with the arithmetic of ggml's
+// dequantize_* (dequantize.cuh) for that value: the same float operations in the same order, so the same fp16 after the cast
+template <ggml_type type>
+static __device__ __forceinline__ void qpn_sub32_to_f32(const typename qpn_t<type>::block & b, const int s, float * v) {
+    if constexpr (type == GGML_TYPE_Q4_K) {
+        const float dall = __low2half(b.dm);
+        const float dmin = __high2half(b.dm);
+        uint8_t sc, m;
+        get_scale_min_k4(s, b.scales, sc, m);
+        const float d = dall * sc; const float mm = dmin * m;
+        const uint8_t * q = b.qs + 32*(s/2);
+#pragma unroll
+        for (int l = 0; l < 32; ++l) {
+            v[l] = (s & 1) ? d * (q[l] >> 4) - mm : d * (q[l] & 0xF) - mm;
+        }
+    } else if constexpr (type == GGML_TYPE_Q5_K) {
+        const float dall = __low2half(b.dm);
+        const float dmin = __high2half(b.dm);
+        uint8_t sc, m;
+        get_scale_min_k4(s, b.scales, sc, m);
+        const float d = dall * sc; const float mm = dmin * m;
+        const uint8_t * ql = b.qs + 32*(s/2);
+        const uint8_t   hm = 1 << s;
+#pragma unroll
+        for (int l = 0; l < 32; ++l) {
+            v[l] = (s & 1) ? d * ((ql[l] >> 4) + (b.qh[l] & hm ? 16 : 0)) - mm
+                           : d * ((ql[l] & 0xF) + (b.qh[l] & hm ? 16 : 0)) - mm;
+        }
+    } else if constexpr (type == GGML_TYPE_Q6_K) {
+        const float d  = b.d;
+        const int   ip = s/4, q4 = s%4;
+        const uint8_t * ql = b.ql + 64*ip + 32*(q4 & 1);
+        const uint8_t * qh = b.qh + 32*ip;
+#pragma unroll
+        for (int l = 0; l < 32; ++l) {
+            const int8_t * sc = b.scales + 8*ip + l/16 + 2*q4;
+            const int nib = q4 >= 2 ? (ql[l] >> 4) : (ql[l] & 0xF);
+            v[l] = d * sc[0] * ((int8_t)(nib | (((qh[l] >> (2*q4)) & 3) << 4)) - 32);
+        }
+    } else if constexpr (type == GGML_TYPE_IQ4_XS) {
+        const float d = (float)b.d * ((((b.scales_l[s/2] >> 4*(s%2)) & 0xf) | (((b.scales_h >> 2*s) & 3) << 4)) - 32);
+        const uint8_t * q4 = b.qs + 16*s;
+#pragma unroll
+        for (int j = 0; j < 16; ++j) {
+            v[j +  0] = d * kvalues_iq4nl[q4[j] & 0xf];
+            v[j + 16] = d * kvalues_iq4nl[q4[j] >>  4];
+        }
+    }
+}
+
+template <ggml_type type>
+static constexpr bool qpn_has_fast_expand() {
+    return type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K || type == GGML_TYPE_IQ4_XS;
+}
+
+// the codes of columns 32j..32j+31 of one row (one chunk word set), column l = 8q + s in word q at nibble pos(s)
+template <ggml_type type>
+static __device__ __forceinline__ int qpn_code4(const uint32_t * c4, const int l) {
+    const int q = l/8, s = l % 8;
+    return (c4[q] >> (4*(qpn_iq4<type>() ? s : qpn_nib(s)))) & 0xF;
+}
+
+// the prefill expansion of a repacked weight (ggml_cuda_qpn_to_fp16), straight from the repacked layout: thread (r, j) reads
+// row r's chunk word of sub-block j (columns 32j..32j+31) and that row's scales, computes the 32 values with the arithmetic of
+// ggml's dequantize_* (dequantize.cuh; the same float operations in the same order, as qpn_sub32_to_f32), and writes them as
+// four 16-byte stores, so every row goes out as whole 512-byte runs. Rebuilding the GGUF blocks first (one warp, 256 serial
+// steps per row, the other warps waiting) ran at a third of the memory bandwidth: 0.8 ms per 27B FFN weight
+template <ggml_type type>
+static __global__ void __launch_bounds__(256) qpn_to_fp16_fast_kernel(const char * __restrict__ W, half * __restrict__ y, const int nsb, const int64_t K) {
+    constexpr int TSB = qpn_tsb<type>();
+    const int tile = blockIdx.x / nsb, sb = blockIdx.x % nsb;
+    const int r = threadIdx.x / 8, j = threadIdx.x % 8;
+    const char * tsb = W + ((int64_t) tile*nsb + sb)*TSB;
+    float v[32];
+    if constexpr (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K) {
+        constexpr int ch0 = type == GGML_TYPE_Q4_K ? 1 : 3;
+        const uint4 hd = *(const uint4 *) (tsb + r*16); // d, dmin, scales
+        const uint4 cw = *(const uint4 *) (tsb + (ch0 + j)*QPN_CHUNK + r*16);
+        const uint32_t c4[4] = {cw.x, cw.y, cw.z, cw.w};
+        half2 dm;
+        memcpy(&dm, &hd.x, 4);
+        const uint32_t sw[3] = {hd.y, hd.z, hd.w};
+        const float dall = __low2half(dm);
+        const float dmin = __high2half(dm);
+        uint8_t sc, m;
+        get_scale_min_k4(j, (const uint8_t *) sw, sc, m);
+        const float d = dall * sc; const float mm = dmin * m;
+        if constexpr (type == GGML_TYPE_Q5_K) {
+            const uint32_t hw = *(const uint32_t *) (tsb + (1 + j/4)*QPN_CHUNK + r*16 + 4*(j % 4)); // w[4 + j]
+#pragma unroll
+            for (int l = 0; l < 32; ++l) {
+                v[l] = d * (qpn_code4<type>(c4, l) + ((hw >> qpn_hb5(l/8, l % 8)) & 1 ? 16 : 0)) - mm;
+            }
+        } else {
+#pragma unroll
+            for (int l = 0; l < 32; ++l) {
+                v[l] = d * qpn_code4<type>(c4, l) - mm;
+            }
+        }
+    } else if constexpr (type == GGML_TYPE_Q6_K) {
+        const uint4 cw = *(const uint4 *) (tsb + j*QPN_CHUNK + r*16);
+        const uint32_t c4[4] = {cw.x, cw.y, cw.z, cw.w};
+        const uint2 hw = *(const uint2 *) (tsb + (8 + j/2)*QPN_CHUNK + r*16 + 4*((2*j) % 4)); // w[32 + 2j], w[33 + 2j]
+        const uint4 sv = *(const uint4 *) (tsb + 12*QPN_CHUNK + r*16);                         // the 16 scales
+        const int8_t * scales = (const int8_t *) &sv;
+        const uint16_t dh = (uint16_t) qpn_load_tail<type>(tsb, r).x;
+        const float d = __ushort_as_half(dh);
+        const int ip = j/4, q4 = j % 4;
+#pragma unroll
+        for (int l = 0; l < 32; ++l) {
+            const int q = l/8, s = l % 8;
+            const uint32_t h = q < 2 ? hw.x : hw.y;
+            const int c = qpn_code4<type>(c4, l) | (((h >> qpn_hb6(q, s)) & 3) << 4);
+            const int8_t * sc = scales + 8*ip + l/16 + 2*q4;
+            v[l] = d * sc[0] * ((int8_t) c - 32);
+        }
+    } else if constexpr (type == GGML_TYPE_IQ4_XS) {
+        const uint4 cw = *(const uint4 *) (tsb + j*QPN_CHUNK + r*16);
+        const uint32_t c4[4] = {cw.x, cw.y, cw.z, cw.w};
+        const uint4 tl = qpn_load_tail<type>(tsb, r);
+        block_iq4_xs b;
+        memcpy(&b, &tl, 8); // d, scales_h, scales_l
+        const float d = (float)b.d * ((((b.scales_l[j/2] >> 4*(j%2)) & 0xf) | (((b.scales_h >> 2*j) & 3) << 4)) - 32);
+#pragma unroll
+        for (int l = 0; l < 32; ++l) {
+            v[l] = d * kvalues_iq4nl[qpn_code4<type>(c4, l)];
+        }
+    }
+    uint4 * dst = (uint4 *) (y + (int64_t) (tile*32 + r)*K + sb*QK_K + 32*j);
+#pragma unroll
+    for (int c = 0; c < 4; ++c) {
+        half2 h[4];
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            h[k] = make_half2(ggml_cuda_cast<half>(v[8*c + 2*k]), ggml_cuda_cast<half>(v[8*c + 2*k + 1]));
+        }
+        dst[c] = *(const uint4 *) h;
+    }
+}
+
 // Rebuilds the GGUF blocks of one tile-superblock in shared memory and dequantizes them with ggml's own functions
 // (dequantize.cuh), so the values are those ggml's to_fp16 gives for the original tensor.
 template <ggml_type type>
@@ -2321,6 +2461,175 @@ static __global__ void qpn_unrepack_kernel(const char * __restrict__ W, char * _
     }
 }
 
+// word i of row r's chunk words in a tile-superblock (w[i] of qpn_load_row)
+static __device__ __forceinline__ uint32_t qpn_word(const char * tsb, const int r, const int i) {
+    return *(const uint32_t *) (tsb + (i/4)*QPN_CHUNK + r*16 + 4*(i % 4));
+}
+static __device__ __forceinline__ uint4 qpn_chunk_row(const char * tsb, const int r, const int ch) {
+    return *(const uint4 *) (tsb + ch*QPN_CHUNK + r*16);
+}
+// 32 bytes as 8 words into p, 2-byte aligned (Q6_K blocks) or 4-byte aligned
+template <int A>
+static __device__ __forceinline__ void qpn_st32(unsigned char * p, const uint32_t * q) {
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        if constexpr (A >= 4) {
+            ((uint32_t *) p)[i] = q[i];
+        } else {
+            ((uint16_t *) p)[2*i] = (uint16_t) q[i]; ((uint16_t *) p)[2*i + 1] = (uint16_t) (q[i] >> 16);
+        }
+    }
+}
+template <ggml_type type>
+static constexpr __host__ __device__ bool qpn_has_fast_unrepack() {
+    return type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K || type == GGML_TYPE_IQ4_XS;
+}
+
+// the same bytes as qpn_unrepack_kernel, for the device-side unrepack of the MMQ path. Q4_K, Q5_K, Q6_K, IQ4_XS: four
+// threads per row build its GGUF block in shared memory straight from the repacked words, each a disjoint 32-byte run of
+// codes (plus the header, scales, d), the high-bit bytes Q5_K and Q6_K share between sub-blocks ORed across the row's lanes;
+// other types: one warp rebuilds the 32 blocks as qpn_unrepack_kernel does. Then 128 threads copy them out a block-aligned
+// word at a time (16 bytes where the block size allows), rows of consecutive threads landing on consecutive addresses
+template <ggml_type type>
+static __global__ void __launch_bounds__(128) qpn_unrepack_fast_kernel(const char * __restrict__ W, char * __restrict__ dst, const int nsb) {
+    typedef typename qpn_t<type>::block block;
+    constexpr int NCH = qpn_t<type>::NCH, TSB = qpn_tsb<type>(), BS = sizeof(block);
+    constexpr int U   = BS % 16 == 0 ? 16 : BS % 8 == 0 ? 8 : BS % 4 == 0 ? 4 : 2;
+    constexpr int NU  = BS / U;
+    __shared__ __align__(16) unsigned char raw[32*BS];
+    block * blk = (block *) raw;
+    const int tile = blockIdx.x / nsb, sb = blockIdx.x % nsb;
+    const char * tsb = W + ((int64_t) tile*nsb + sb)*TSB;
+    if constexpr (qpn_has_fast_unrepack<type>()) {
+        const int r = threadIdx.x / 4, t = threadIdx.x % 4;
+        unsigned char * b = raw + r*BS;
+        uint32_t q[8] = {0}, h[8] = {0};
+        if constexpr (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K) {
+            // qs[32t + l]: column l of sub-block 2t (low nibble) and of 2t + 1 (high)
+            constexpr int ch0 = type == GGML_TYPE_Q4_K ? 1 : 3, qs0 = type == GGML_TYPE_Q4_K ? 16 : 48;
+            const uint4 c0 = qpn_chunk_row(tsb, r, ch0 + 2*t), c1 = qpn_chunk_row(tsb, r, ch0 + 2*t + 1);
+            const uint32_t lo[4] = {c0.x, c0.y, c0.z, c0.w}, hi[4] = {c1.x, c1.y, c1.z, c1.w};
+#pragma unroll
+            for (int l = 0; l < 32; ++l) {
+                q[l/4] |= (uint32_t) (qpn_code4<type>(lo, l) | qpn_code4<type>(hi, l) << 4) << (8*(l % 4));
+            }
+            qpn_st32<4>(b + qs0 + 32*t, q);
+            if (t == 0) {
+                *(uint4 *) b = qpn_chunk_row(tsb, r, 0); // d, dmin, scales
+            }
+            if constexpr (type == GGML_TYPE_Q5_K) {
+                // qh[l] bit j: the fifth bit of column l of sub-block j (high-bit word w[4 + j])
+                const uint32_t w0 = qpn_word(tsb, r, 4 + 2*t), w1 = qpn_word(tsb, r, 4 + 2*t + 1);
+#pragma unroll
+                for (int l = 0; l < 32; ++l) {
+                    const int p = qpn_hb5(l/8, l % 8);
+                    h[l/4] |= (uint32_t) ((((w0 >> p) & 1) << (2*t)) | (((w1 >> p) & 1) << (2*t + 1))) << (8*(l % 4));
+                }
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    h[i] |= __shfl_xor_sync(0xffffffff, h[i], 1);
+                    h[i] |= __shfl_xor_sync(0xffffffff, h[i], 2);
+                }
+                if (t == 1) {
+                    qpn_st32<4>(b + 16, h);
+                }
+            }
+        } else if constexpr (type == GGML_TYPE_Q6_K) {
+            // ql[64ip + 32hh + l]: column l of sub-block 4ip + hh (low nibble) and of 4ip + hh + 2 (high); qh[32ip + l] bits 2g, 2g + 1:
+            // bits 4-5 of column l of sub-block 4ip + g (high-bit words w[32 + 2j + q/2])
+            const int ip = t/2, hh = t % 2, j0 = 4*ip + hh, j1 = j0 + 2;
+            const uint4 c0 = qpn_chunk_row(tsb, r, j0), c1 = qpn_chunk_row(tsb, r, j1);
+            const uint32_t lo[4] = {c0.x, c0.y, c0.z, c0.w}, hi[4] = {c1.x, c1.y, c1.z, c1.w};
+            const uint32_t a0 = qpn_word(tsb, r, 32 + 2*j0), a1 = qpn_word(tsb, r, 33 + 2*j0);
+            const uint32_t b0 = qpn_word(tsb, r, 32 + 2*j1), b1 = qpn_word(tsb, r, 33 + 2*j1);
+#pragma unroll
+            for (int l = 0; l < 32; ++l) {
+                const int qq = l/8, s = l % 8, p = qpn_hb6(qq, s);
+                q[l/4] |= (uint32_t) (qpn_code4<type>(lo, l) | qpn_code4<type>(hi, l) << 4) << (8*(l % 4));
+                const uint32_t ha = ((qq < 2 ? a0 : a1) >> p) & 3, hb = ((qq < 2 ? b0 : b1) >> p) & 3;
+                h[l/4] |= (uint32_t) ((ha << (2*hh)) | (hb << (2*hh + 4))) << (8*(l % 4));
+            }
+            qpn_st32<2>(b + 64*ip + 32*hh, q);
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                h[i] |= __shfl_xor_sync(0xffffffff, h[i], 1);
+            }
+            if (hh == 0) {
+                qpn_st32<2>(b + 128 + 32*ip, h);
+            }
+            if (t == 0) {
+                const uint4 sv = qpn_chunk_row(tsb, r, 12);
+                const uint32_t sw[4] = {sv.x, sv.y, sv.z, sv.w};
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    ((uint16_t *) (b + 192))[2*i] = (uint16_t) sw[i]; ((uint16_t *) (b + 192))[2*i + 1] = (uint16_t) (sw[i] >> 16);
+                }
+                *(uint16_t *) (b + 208) = (uint16_t) qpn_load_tail<type>(tsb, r).x;
+            }
+        } else {
+            // IQ4_XS: qs[16j + m]: column m of sub-block j (low nibble) and column m + 16 (high), j = 2t, 2t + 1
+#pragma unroll
+            for (int jj = 0; jj < 2; ++jj) {
+                const uint4 c = qpn_chunk_row(tsb, r, 2*t + jj);
+                const uint32_t cw[4] = {c.x, c.y, c.z, c.w};
+#pragma unroll
+                for (int m = 0; m < 16; ++m) {
+                    q[4*jj + m/4] |= (uint32_t) (qpn_code4<type>(cw, m) | qpn_code4<type>(cw, m + 16) << 4) << (8*(m % 4));
+                }
+            }
+            qpn_st32<4>(b + 8 + 32*t, q);
+            if (t == 0) {
+                const uint4 tl = qpn_load_tail<type>(tsb, r);
+                ((uint32_t *) b)[0] = tl.x; ((uint32_t *) b)[1] = tl.y; // d, scales_h, scales_l
+            }
+        }
+    } else if (threadIdx.x < 32) {
+        uint32_t w[NCH*4];
+        uint4    tl;
+        qpn_load_row<type>(tsb, threadIdx.x, w, tl);
+        qpn_unpack_row<type>(w, tl, &blk[threadIdx.x]);
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < 32*NU; i += blockDim.x) {
+        const int r = i / NU, o = i % NU;
+        char       * d = dst + ((int64_t) (tile*32 + r)*nsb + sb)*BS + o*U;
+        const char * s = (const char *) &blk[r] + o*U;
+        if constexpr (U == 16) {
+            *(uint4 *) d = *(const uint4 *) s;
+        } else if constexpr (U == 8) {
+            *(uint2 *) d = *(const uint2 *) s;
+        } else if constexpr (U == 4) {
+            *(uint32_t *) d = *(const uint32_t *) s;
+        } else {
+            *(uint16_t *) d = *(const uint16_t *) s;
+        }
+    }
+}
+
+// LLAMA_QPN_EXPAND_CHECK=1: every expansion / device unrepack also runs the earlier kernel into a second buffer the caller
+// provides and compares the two on the device, printing the first differing element of a call (nothing on agreement)
+static __global__ void qpn_check_equal_kernel(const uint16_t * __restrict__ a, const uint16_t * __restrict__ b, const int64_t n, const int kind) {
+    for (int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x*blockDim.x) {
+        if (a[i] != b[i]) {
+            printf("qpn %s check: element %lld differs (new 0x%04x, old 0x%04x)\n", kind ? "unrepack" : "expand",
+                   (long long) i, (unsigned) a[i], (unsigned) b[i]);
+            return;
+        }
+    }
+}
+
+bool ggml_cuda_qpn_check_enabled() {
+    static const bool on = [] {
+        const char * e = getenv("LLAMA_QPN_EXPAND_CHECK");
+        const bool v = e && atoi(e) != 0;
+        if (v) {
+            GGML_LOG_WARN("%s: LLAMA_QPN_EXPAND_CHECK: every QPN expansion / unrepack is checked against the earlier kernel\n", __func__);
+        }
+        return v;
+    }();
+    return on;
+}
+
 bool ggml_cuda_qpn_unpack(const ggml_tensor * t, void * host_dst, const int device) {
     if (!ggml_cuda_qpn_is_repacked(t) || t->view_src != nullptr || ggml_cuda_qpn_type_bit(t->type) == 0) {
         return false;
@@ -2357,11 +2666,65 @@ bool ggml_cuda_qpn_unpack(const ggml_tensor * t, void * host_dst, const int devi
     return true;
 }
 
-void ggml_cuda_qpn_to_fp16(const ggml_tensor * src0, half * dst, cudaStream_t stream) {
+template <ggml_type type>
+static void qpn_unpack_device_type(const char * W, char * d, const int nsb, const unsigned nblk, cudaStream_t stream, char * check) {
+    qpn_unrepack_fast_kernel<type><<<nblk, 128, 0, stream>>>(W, d, nsb);
+    if (check) {
+        qpn_unrepack_kernel<type><<<nblk, 32, 0, stream>>>(W, check, nsb);
+        const int64_t n = (int64_t) nblk*32*sizeof(typename qpn_t<type>::block)/2;
+        qpn_check_equal_kernel<<<1024, 256, 0, stream>>>((const uint16_t *) d, (const uint16_t *) check, n, 1);
+    }
+}
+
+bool ggml_cuda_qpn_unpack_device(const ggml_tensor * t, void * dst, cudaStream_t stream, void * check_dst) {
+    if (!ggml_cuda_qpn_is_repacked(t) || t->view_src != nullptr) {
+        return false;
+    }
+    const int      nsb  = (int) (t->ne[0]/QK_K);
+    const unsigned nblk = (unsigned) ((t->ne[1]/32)*nsb);
+    const char *   W    = (const char *) t->data;
+    char *         d    = (char *) dst;
+    char *         c    = (char *) check_dst;
+    switch (t->type) {
+        case GGML_TYPE_Q4_K:   qpn_unpack_device_type<GGML_TYPE_Q4_K>  (W, d, nsb, nblk, stream, c); break;
+        case GGML_TYPE_Q5_K:   qpn_unpack_device_type<GGML_TYPE_Q5_K>  (W, d, nsb, nblk, stream, c); break;
+        case GGML_TYPE_Q6_K:   qpn_unpack_device_type<GGML_TYPE_Q6_K>  (W, d, nsb, nblk, stream, c); break;
+        case GGML_TYPE_IQ4_XS: qpn_unpack_device_type<GGML_TYPE_IQ4_XS>(W, d, nsb, nblk, stream, c); break;
+        case GGML_TYPE_IQ4_NL: qpn_unpack_device_type<GGML_TYPE_IQ4_NL>(W, d, nsb, nblk, stream, c); break;
+        case GGML_TYPE_Q3_K:   qpn_unpack_device_type<GGML_TYPE_Q3_K>  (W, d, nsb, nblk, stream, c); break;
+        case GGML_TYPE_Q8_0:   qpn_unpack_device_type<GGML_TYPE_Q8_0>  (W, d, nsb, nblk, stream, c); break;
+        default: return false;
+    }
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
+template <ggml_type type>
+static void qpn_to_fp16_fast_type(const char * W, half * dst, const int nsb, const unsigned nblk, const int64_t K, cudaStream_t stream, half * check) {
+    qpn_to_fp16_fast_kernel<type><<<nblk, 256, 0, stream>>>(W, dst, nsb, K);
+    if (check) {
+        constexpr int nth = type == GGML_TYPE_Q4_K || type == GGML_TYPE_IQ4_XS ? 32 : 64; // the earlier kernel's thread count
+        qpn_to_fp16_kernel<type><<<nblk, nth, 0, stream>>>(W, check, nsb, K);
+        qpn_check_equal_kernel<<<1024, 256, 0, stream>>>((const uint16_t *) dst, (const uint16_t *) check, (int64_t) nblk*32*QK_K, 0);
+    }
+}
+
+void ggml_cuda_qpn_to_fp16(const ggml_tensor * src0, half * dst, cudaStream_t stream, half * check_dst) {
     const int     nsb    = (int) (src0->ne[0]/QK_K);
     const int64_t ntiles = src0->ne[1]/32;
     const char *  W      = (const char *) src0->data;
     const unsigned nblk  = (unsigned) (ntiles*nsb);
+    // the four types of a K-quant model's large weights take the coalesced kernel (LLAMA_QPN_FAST_EXPAND=0: the earlier one)
+    static const bool fast = [] { const char * e = getenv("LLAMA_QPN_FAST_EXPAND"); return e == nullptr || atoi(e) != 0; }();
+    if (fast) {
+        switch (src0->type) {
+            case GGML_TYPE_Q4_K:   qpn_to_fp16_fast_type<GGML_TYPE_Q4_K>  (W, dst, nsb, nblk, src0->ne[0], stream, check_dst); CUDA_CHECK(cudaGetLastError()); return;
+            case GGML_TYPE_Q5_K:   qpn_to_fp16_fast_type<GGML_TYPE_Q5_K>  (W, dst, nsb, nblk, src0->ne[0], stream, check_dst); CUDA_CHECK(cudaGetLastError()); return;
+            case GGML_TYPE_Q6_K:   qpn_to_fp16_fast_type<GGML_TYPE_Q6_K>  (W, dst, nsb, nblk, src0->ne[0], stream, check_dst); CUDA_CHECK(cudaGetLastError()); return;
+            case GGML_TYPE_IQ4_XS: qpn_to_fp16_fast_type<GGML_TYPE_IQ4_XS>(W, dst, nsb, nblk, src0->ne[0], stream, check_dst); CUDA_CHECK(cudaGetLastError()); return;
+            default: break;
+        }
+    }
     switch (src0->type) {
         case GGML_TYPE_Q4_K: qpn_to_fp16_kernel<GGML_TYPE_Q4_K><<<nblk, 32, 0, stream>>>(W, dst, nsb, src0->ne[0]); break;
         case GGML_TYPE_Q5_K: qpn_to_fp16_kernel<GGML_TYPE_Q5_K><<<nblk, 64, 0, stream>>>(W, dst, nsb, src0->ne[0]); break;

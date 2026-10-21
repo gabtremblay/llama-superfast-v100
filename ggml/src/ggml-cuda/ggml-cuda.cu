@@ -2090,6 +2090,19 @@ static bool ggml_cuda_qpn_is_expansion(const ggml_tensor * t) {
     return t != nullptr && t->op == GGML_OP_CPY && t->type == GGML_TYPE_F16 && ggml_cuda_qpn_is_repacked(t->src[0]);
 }
 
+// a product on a whole repacked weight, past the tensor-core kernel, that MMQ takes at this width (on Volta: under the
+// MMQ / cuBLAS crossover, ggml_cuda_should_use_mmq) runs MMQ on the weight's GGUF bytes, unrepacked into a pooled buffer;
+// LLAMA_QPN_MMQ=0 keeps the fp16 + cuBLAS route for every width. 2-D inputs only, and weights of at most 512 MiB
+// (the scratch is the weight's size)
+static bool ggml_cuda_qpn_mmq_takes(const ggml_tensor * src0, const ggml_tensor * src1) {
+    static const bool on = [] { const char * e = getenv("LLAMA_QPN_MMQ"); return e == nullptr || atoi(e) != 0; }();
+    if (!on || src0->view_src != nullptr || src1->ne[2] != 1 || src1->ne[3] != 1 || ggml_nbytes(src0) > (size_t) 512*1024*1024) {
+        return false;
+    }
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    return ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[1], 0);
+}
+
 static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
                                           const ggml_tensor * ffn_gate,
                                           const ggml_tensor * glu,
@@ -2275,9 +2288,21 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
                 return;
             }
             ggml_cuda_mul_mat_qpn(ctx, src0, src1, dst);
+        } else if (ggml_cuda_qpn_mmq_takes(src0, src1)) {
+            // past the tensor-core kernel but under the MMQ / cuBLAS crossover (the small prompt batches of a chat turn):
+            // the GGUF bytes back into a pooled buffer (one read and one write of the weight's own size) and MMQ, instead of
+            // the whole weight as fp16 for cuBLAS. V100, 27B FFN products at 128 tokens: ~1.05 ms against ~1.4 ms
+            const bool check = ggml_cuda_qpn_check_enabled();
+            ggml_cuda_pool_alloc<char> wq(ctx.pool(), ggml_nbytes(src0)*(check ? 2 : 1));
+            GGML_ASSERT(ggml_cuda_qpn_unpack_device(src0, wq.get(), ctx.stream(), check ? wq.get() + ggml_nbytes(src0) : nullptr));
+            ggml_tensor src0_q = *src0;
+            src0_q.data   = wq.get();
+            src0_q.flags &= ~GGML_TENSOR_FLAG_BACKEND_LAYOUT;
+            ggml_cuda_mul_mat_q(ctx, &src0_q, src1, nullptr, dst);
         } else {
-            ggml_cuda_pool_alloc<half> w16(ctx.pool(), ggml_nelements(src0));
-            ggml_cuda_qpn_to_fp16(src0, w16.get(), ctx.stream());
+            const bool check = ggml_cuda_qpn_check_enabled();
+            ggml_cuda_pool_alloc<half> w16(ctx.pool(), ggml_nelements(src0)*(check ? 2 : 1));
+            ggml_cuda_qpn_to_fp16(src0, w16.get(), ctx.stream(), check ? w16.get() + ggml_nelements(src0) : nullptr);
             ggml_tensor src0_f16 = *src0;
             src0_f16.type     = GGML_TYPE_F16;
             src0_f16.data     = w16.get();

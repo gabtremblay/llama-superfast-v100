@@ -357,7 +357,19 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
         if (n_experts > 0 && ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_TURING) {
             return true;
         }
-        return !fp16_mma_hardware_available(cc) || ne11 < MMQ_DP4A_MAX_BATCH_SIZE;
+        // the MMQ / dequantize+cuBLAS crossover. Only Volta gets here with FP16 tensor cores (Turing+ returned above),
+        // and there the dequantize+cuBLAS path carries ~1.1 ms of fixed cost per 27B FFN product, so MMQ stays faster
+        // well past MMQ_DP4A_MAX_BATCH_SIZE (V100, 17408x5120 / 5120x17408, Q4_K/Q5_K/Q6_K, MMQ vs cuBLAS in us):
+        // 64 tok 500 vs 1250, 128 950 vs 1400, 160 1170 vs 1480, 192 ~1340 vs ~1450 (Q4_K) / ~1360 vs ~1410 (Q5_K/Q6_K),
+        // 224 even, 256 1720 vs 1500. The small prompt batches of a chat turn (tens to ~200 tokens) live in that range.
+        // GGML_CUDA_MMQ_MAX_BATCH overrides it.
+        static const int64_t mmq_max_batch = [] {
+            const char * e = getenv("GGML_CUDA_MMQ_MAX_BATCH");
+            return e ? (int64_t) atoll(e) : (int64_t) 0;
+        }();
+        const int64_t max_batch = mmq_max_batch > 0 ? mmq_max_batch :
+            (cc == GGML_CUDA_CC_VOLTA ? 192 : (int64_t) MMQ_DP4A_MAX_BATCH_SIZE);
+        return !fp16_mma_hardware_available(cc) || ne11 < max_batch;
     }
 
     if (amd_mfma_available(cc)) {
