@@ -382,9 +382,9 @@ private:
     // [TAG_KV_WINDOW] see get_kv_window. LLAMA_KV_WINDOW=0: off; LLAMA_KV_WINDOW_MIN_TOKENS (default 1)
     bool     kv_window         = false;
     uint32_t kv_window_min_tok = 1;
-    // ... and find_slot's placement after a sequence's last cell, for prompt ubatches of at least this many tokens
-    // (LLAMA_KV_PLACE_MIN_TOKENS, default 16: above the 8-token verify ubatches)
-    uint32_t kv_place_min_tok  = 16;
+    // ... and find_slot's placement after a sequence's last cell, for single-sequence ubatches of at least this many tokens
+    // (LLAMA_KV_PLACE_MIN_TOKENS, default 1: decode steps too)
+    uint32_t kv_place_min_tok  = 1;
 
     // maps from a sequence id to a stream id
     std::vector<uint32_t> seq_to_stream;
