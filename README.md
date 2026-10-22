@@ -1,5 +1,8 @@
 # llama-superfast-v100-q8-inscora
 
+Created for **one V100 card**, a single user, and two concurrent slots on a unified KV cache, to make agentic work
+palatable while maximizing context size.
+
 A fork of [bitexploder/llama-superfast-v100](https://github.com/bitexploder/llama-superfast-v100), the llama.cpp fork
 tuned for the Tesla V100 (Volta, `sm_70`). This fork adds:
 
@@ -10,8 +13,8 @@ tuned for the Tesla V100 (Volta, `sm_70`). This fork adds:
 - prompt work (DFlash2 features, checkpoints, masks) that stays on the GPU instead of crossing the host link;
 - a smaller CUDA graph cache, which freed ~1.2 GB of VRAM that only grew under real traffic.
 
-The target is **Qwen3.8-27B (`UD-Q4_K_XL`) with the DFlash2 draft on one V100 PCIe 32 GB**, two server slots: one user
-whose agent harness sends side requests in parallel with the main thinking thread. Our card sits behind a PCIe Gen3 x4
+The model is Qwen3.8-27B (`UD-Q4_K_XL`) with the DFlash2 draft on a V100 PCIe 32 GB. The two slots serve one user: the
+main thinking thread, and the side requests an agent harness sends in parallel with it. Our card sits behind a PCIe Gen3 x4
 eGPU link (~3.3 GB/s), so anything that crosses the host link is on the critical path; the gains from keeping work on
 the GPU are largest on a link like that.
 
