@@ -35,7 +35,7 @@ fork runs the [Run](#run) line below.
 | Cold prefill, ~48k-token prompt | 797 tok/s | 837 tok/s |
 | Time to first token, new ~125-token chat turn (median) | 657 ms | 429 ms |
 | Decode, 400 tokens, three prompts | 95 / 93 / 99 tok/s | 92 / 91 / 97 tok/s |
-| Context | 2 × 65,536 | one 245,760-token pool (`--kv-unified`) |
+| Context | 2 concurrent slots of 65,536 each | 2 concurrent slots sharing one 245,760-token pool (`--kv-unified`) |
 
 Decode is 2–3% slower, the cost of reading an 8-bit cache, in exchange for 1.9× the context.
 
