@@ -76,6 +76,31 @@ All of it is on the `q8-attention` branch, in four commits on top of upstream `4
     unused graph stays cached.
   - `GGML_CUDA_GRAPH_STATS=1` logs the cached graph count, at the server's debug log level.
 
+**4. Unified KV at full speed** (`146f3c4`, `9a20120`)
+
+- **A per-batch window over the cache.** With `--kv-unified`, both slots share one cache. Every batch used to attend
+  over the other slot's cells too, masked out but still paid for.
+  - Now a batch of one sequence reads only the cells from its first to its last (aligned to 256). The K/V views and the
+    mask start there, and graph reuse keys on the window.
+  - Batches holding both slots skip it: their window would span everything, and the scan would cost ~4% of two-slot
+    decode.
+  - The window is on for the qwen35 line only, whose attention uses nothing else. Switches: `LLAMA_KV_WINDOW=0` turns it
+    off; `LLAMA_KV_WINDOW_MIN_TOKENS` sets the smallest batch it applies to.
+- **Both slots' masks on the GPU.** The device mask builder handled only sequence 0 of a unified cache, so slot 1's masks
+  were built on the host and sent over the eGPU link every batch. It now keeps one cell mirror per sequence and builds
+  mixed batches run by run.
+- **Measured with the other slot holding 66k tokens:**
+
+  | | Before | After | Split cache |
+  |---|---|---|---|
+  | Prefill, 24k prompt | 549 tok/s | 874 tok/s | 918 tok/s |
+  | Slot 0 decode | 75 / 74 / 96 tok/s | 90 / 90 / 110 tok/s | 88 / 91 / 106 tok/s |
+
+  Repeated 40k and 64k prompts alternating between loaded slots read at the split cache's speed: 858 vs 858 tok/s and
+  776 vs 779 tok/s.
+- **Verified:** device masks match the host's bit for bit (`LLAMA_KQ_MASK_DEVICE_CHECK`, 711 masks under two-slot load).
+  Temperature-0 outputs are identical with the window on and off.
+
 ## Measured (one V100 32 GB, eGPU, Qwen3.8-27B UD-Q4_K_XL, DFlash2, q8_0 KV, two slots)
 
 | | upstream route + q8 KV | this fork |
@@ -84,7 +109,7 @@ All of it is on the `q8-attention` branch, in four commits on top of upstream `4
 | Cold prefill, 5.6k-token prompt | 760 tok/s | 851 tok/s |
 | Time to first token, new ~125-token chat turn (median) | 828 ms | 680 ms, 430 ms with `--cache-ram 0` |
 | Decode, 400 tokens, three prompts | 88 / 90 / 104 tok/s | 88 / 91 / 106 tok/s |
-| Context | 2 × 98,304 | 2 × 106,496 |
+| Context | 2 × 98,304 | 2 × 106,496, or one 212,992-token pool (`--kv-unified`) |
 
 The "upstream route" column is the same build with this fork's prefill and GPU-residency changes switched off.
 
@@ -98,9 +123,18 @@ The "upstream route" column is the same build with this fork's prefill and GPU-r
 | **DFlash2, 2 × 106,496 (`64107c5`)** | **109.5 tok/s** | 48.9 ms | 19.5 tok/s | **324 ms** | 92.6 tok/s | **836 tok/s** |
 | DFlash2, unified pool of 212,992 (`64107c5`) | 109.7 tok/s | 45.8 ms | 21.2 tok/s | 317 ms | 92.6 tok/s | 531 tok/s |
 
+The table's rows ran in the afternoon. In a warmer room the same card throttles harder at its 200 W cap (76 °C, a third
+of busy samples power-capped), and every build drops ~10–15%. Compare runs from the same session only. Two runs from one
+night:
+
+| Run (same night) | Combined decode | Update p99 | TTFT p50 | Aggregate @8 | Prefill @64k |
+|---|---|---|---|---|---|
+| Unified 212,992, before the window (`64107c5`) | 93.8 tok/s | 49.8 ms | 372 ms | 83.7 tok/s | 531 tok/s |
+| **Unified 212,992, with the window (`9a20120`)** | **96.1 tok/s** | 49.5 ms | 371 ms | **90.4 tok/s** | **683 tok/s** |
+
 With `--kv-unified`, either slot can use most of the shared pool: one slot took a 157k-token prompt while the other still
-answered a side request. Decode and latency match the split cache, but long prefills are about a third slower. Pick
-unified when one conversation needs more than half the context; pick the split cache when long prompts dominate.
+answered a side request. Since the window (section 4), decode, latency and prefill match the split cache, so unified is
+the default below. Use the split cache only to cap each slot at half the pool.
 
 `--cache-ram 0` turns off the host prompt cache. Saving a slot's state to host memory costs about 220 ms over this link
 each time a slot switches conversations. With one user and pinned slots (`id_slot` in the request), the cache brings
@@ -110,13 +144,18 @@ little.
 
 ```
 LLAMA_TU=0 LLAMA_DFLASH2_HEAD_FILE=$MODELS/mtp-Qwen3.8-27B-Q4_0.gguf \
+LLAMA_SPEC_DRAFT_VOCAB_FILE=models/draft-vocab-qwen3.8-27b.txt \
 build/bin/llama-server -m $MODELS/Qwen3.8-27B-UD-Q4_K_XL.gguf \
   -md $MODELS/Qwen3.8-27B-DFlash2-Q4_K_M.gguf --spec-type draft-dflash --spec-draft-n-max 7 --spec-draft-ubatch 512 \
-  -c 212992 --parallel 2 --no-kv-unified -fa on -ngl 99 -ctk q8_0 -ctv q8_0 -ctkd f16 -ctvd f16 \
+  -c 212992 --parallel 2 --kv-unified -fa on -ngl 99 -ctk q8_0 -ctv q8_0 -ctkd f16 -ctvd f16 \
   -t 12 -b 2048 -ub 2048 --cache-ram 0 --jinja --temp 1.0 --top-p 0.95 --top-k 20
 ```
 
 - `LLAMA_TU=0` is required with DFlash2: the two-user scheduler rejects its long prompts.
+- `LLAMA_SPEC_DRAFT_VOCAB_FILE` restricts the draft to the 131k-token vocabulary subset. Without it, decode is ~5–10%
+  slower. The Docker image sets it.
+- `--kv-unified`: one 212,992-token pool for both slots. With `--no-kv-unified`, each slot gets a fixed half
+  (2 × 106,496).
 - `LLAMA_DFLASH2_HEAD_FILE` points DFlash2's output head at the MTP file's rows.
 - `-b 2048` (equal to `-ub`) keeps the DFlash2 features on the GPU during prefill.
 
