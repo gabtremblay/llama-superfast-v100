@@ -21,6 +21,7 @@ using namespace ggml_cuda_mma;
 #define QPN_MAX_TILES  16384 // row tiles a product split across blocks may have (the counters)
 #define QPN_CHUNK      512 // bytes per chunk: 32 lanes x 16
 #define QPN_MAGIC      0x64006400u
+#define QPN_FB_N       32  // the fp32 fallback's columns (qpn_fallback), every pass width
 
 template <ggml_type type> struct qpn_t;
 template <> struct qpn_t<GGML_TYPE_Q4_K> {
@@ -637,7 +638,7 @@ static __device__ __noinline__ void qpn_fallback(
     typedef typename qpn_t<type>::block block;
     constexpr int NCH = qpn_t<type>::NCH, TSB = qpn_tsb<type>();
     const int lane = threadIdx.x;
-    for (int c = 0; c < 16; ++c) { // up to 16 columns
+    for (int c = 0; c < QPN_FB_N; ++c) { // up to QPN_FB_N columns
         fb[c] = 0.0f;
     }
     for (int sb = sb0; sb < sb1; sb += S) {
@@ -700,9 +701,14 @@ static __device__ __noinline__ void qpn_fallback(
     }
 }
 
-// C elements of a lane that can hold a real token at T tokens: one 8-token B tile (4 or 8), or two at T = 16 (9 to 16
-// tokens, the second tile's at 8 .. 15)
-template <int T> static constexpr __host__ __device__ int qpn_nl() { return T > 8 ? 16 : T > 4 ? 8 : 4; }
+// C elements of a lane that can hold a real token at T tokens: one 8-token B tile (4 or 8), two at T = 16 (9 to 16
+// tokens, the second tile's at 8 .. 15), or four at T = 32 (17 to 32 tokens, tile b's at 8b .. 8b + 7)
+template <int T> static constexpr __host__ __device__ int qpn_nl() { return T > 16 ? 32 : T > 8 ? 16 : T > 4 ? 8 : 4; }
+// the output column of C element l: c0 + (l & 5) within its 8-token tile, + 8 per tile (l >> 3)
+static constexpr __host__ __device__ int qpn_col(const int l) { return (l & 5) + (l & ~7); }
+// the column scale of C element l in cs[] (NL/2 entries: two per 4 columns)
+static constexpr __host__ __device__ int qpn_csi(const int l) { return (l & 1) + ((l & 4) >> 1) + 4*(l >> 3); }
+
 
 // One superblock of one row tile: buf holds this lane's 16 bytes of every chunk (dp: Q6_K's d of rows r0, r0 + 2 in
 // dp.x; IQ4_XS: the lane's row's header),
@@ -961,7 +967,7 @@ template <ggml_type type> struct qpn_stream_t {
 // what the lanes of padding tokens (T <= token < 8) read instead of a real token's fragments:
 // zeros, so they no longer depend on real rows; their outputs are never written, and a real token's C column depends
 // only on its own B column, so the outputs are unchanged. It is the same one load per lane (a warp-wide LDG.128 either way).
-static __device__ uint4 qpn_zero_x[32*16]; // 16 tokens (fragment stride t <= 16)
+static __device__ uint4 qpn_zero_x[32*32]; // 32 tokens (fragment stride t <= 32)
 template <ggml_type type, int T, int NL, bool STAGE, int LA = 2, bool FULL = false>
 static __device__ __forceinline__ void qpn_stream_loop(
         const char * Wp, const int64_t step, int sb, const int sbB, const int S, const bool active, const uint4 * xsm, const int sbA, const half * __restrict__ xh,
@@ -984,10 +990,11 @@ static __device__ __forceinline__ void qpn_stream_loop(
     // LA = 4 holds twice the weight bytes in flight per warp (only load timing moves: the arithmetic is unchanged)
     static_assert(LA == 2 || (LA == 4 && st::CPU2 == 2), "LA = 4: the types with two code chunks per two units");
     constexpr int HBH = LA == 2 || NHB == 0 ? 1 : (LA + JPH - 1)/JPH; // high-bit chunks requested with the next superblock's head
-    // at T = 16 (9 to 16 tokens) two 8-token B tiles share each decoded A fragment, so one weight read serves both;
-    // tile b's C elements are D[8*b .. 8*b + 7], summed in the same order as a pass of 8 (each column bit-identical to it)
-    constexpr int NBT = T > 8 ? 2 : 1;
-    static_assert(NBT == 1 || (!STAGE && NL == 16), "16 tokens: unstaged, 16 C elements a lane");
+    // at T = 16 (9 to 16 tokens) two 8-token B tiles share each decoded A fragment, so one weight read serves both, and
+    // four at T = 32 (17 to 32 tokens); tile b's C elements are D[8*b .. 8*b + 7], summed in the same order as a pass of 8
+    // (each column bit-identical to it)
+    constexpr int NBT = T > 16 ? 4 : T > 8 ? 2 : 1;
+    static_assert(NBT == 1 || (!STAGE && NL == 8*NBT), "16 or 32 tokens: unstaged, 8 C elements a lane per tile");
     // QPN_MAGIC for qpn_decode, as a register: qpn_zero_x is never written, so the OR leaves the value unchanged
     constexpr bool MGR = type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K;
     const uint32_t mg = MGR ? (QPN_MAGIC | __ldg(&qpn_zero_x[0].x)) : QPN_MAGIC;
@@ -1055,19 +1062,27 @@ static __device__ __forceinline__ void qpn_stream_loop(
         const int nBr = tile_B::get_i(0);
         const uint4 * xk = STAGE ? xsm + ((sb - sbA)*32*t + nB) : (FULL || nBr < t) ? (const uint4 *) xh + ((int64_t) sb*32*ts + nB) : qpn_zero_x + nBr;
         const uint4 * xm = (const uint4 *) xs + ((int64_t) sb*ts + nB);
-        // the second tile's tokens 8 .. t - 1 (lanes of padding tokens read qpn_zero_x; their sums a real token's)
-        const uint4 * xk1 = NBT == 1 ? xk : FULL ? xk + 8 : nBr + 8 < t ? (const uint4 *) xh + ((int64_t) sb*32*ts + nBr + 8) : qpn_zero_x + nBr;
-        const uint4 * xm1 = FULL ? xm + 8 : (const uint4 *) xs + ((int64_t) sb*ts + min(nBr + 8, t - 1));
+        // tile b's tokens 8b .. min(8b + 7, t - 1) (lanes of padding tokens read qpn_zero_x; their sums a real token's)
+        const uint4 * xkb[NBT];
+        const uint4 * xmb[NBT];
+        xkb[0] = xk;
+        xmb[0] = xm;
+#pragma unroll
+        for (int b = 1; b < NBT; ++b) {
+            xkb[b] = FULL ? xk + 8*b : nBr + 8*b < t ? (const uint4 *) xh + ((int64_t) sb*32*ts + nBr + 8*b) : qpn_zero_x + nBr;
+            xmb[b] = FULL ? xm + 8*b : (const uint4 *) xs + ((int64_t) sb*ts + min(nBr + 8*b, t - 1));
+        }
 // one decoded fragment A (fragment f of the superblock) into accumulator acc of every B tile
-#define QPN_MMA2(A, f, acc) do {                                                                   \
-            tile_B B;                                                                              \
-            *(uint4 *) B.x = STAGE ? xk[(f)*t] : __ldg(xk + (f)*ts);                               \
-            mma(Ds[0][acc], A, B);                                                                 \
-            if constexpr (NBT == 2) {                                                              \
-                tile_B B1;                                                                         \
-                *(uint4 *) B1.x = __ldg(xk1 + (f)*ts);                                             \
-                mma(Ds[NBT - 1][acc], A, B1);                                                      \
-            }                                                                                      \
+#define QPN_MMA2(A, f, acc) do {                                     \
+            tile_B B;                                                \
+            *(uint4 *) B.x = STAGE ? xk[(f)*t] : __ldg(xk + (f)*ts); \
+            mma(Ds[0][acc], A, B);                                   \
+            _Pragma("unroll")                                        \
+            for (int b_ = 1; b_ < NBT; ++b_) {                       \
+                tile_B B1;                                           \
+                *(uint4 *) B1.x = __ldg(xkb[b_] + (f)*ts);           \
+                mma(Ds[b_][acc], A, B1);                             \
+            }                                                        \
         } while (0)
 
         float cs[NL/2];
@@ -1260,22 +1275,18 @@ static __device__ __forceinline__ void qpn_stream_loop(
             Am.x[2] = qpn_bytes_h2(mnl[1], 0);
             Am.x[3] = qpn_bytes_h2(mnl[1], 2);
             tile_C M[NBT];
-            {
+#pragma unroll
+            for (int b = 0; b < NBT; ++b) {
                 tile_B Bm;
-                *(uint4 *) Bm.x = __ldg(xm);
-                mma(M[0], Am, Bm);
-            }
-            if constexpr (NBT == 2) {
-                tile_B Bm1;
-                *(uint4 *) Bm1.x = __ldg(xm1);
-                mma(M[NBT - 1], Am, Bm1);
+                *(uint4 *) Bm.x = __ldg(xmb[b]);
+                mma(M[b], Am, Bm);
             }
             const float2 dm0 = __half22float2(qpn_u2h(__shfl_sync(0xFFFFFFFF, hdr.x, r0)));
             const float2 dm2 = __half22float2(qpn_u2h(__shfl_sync(0xFFFFFFFF, hdr.x, r0 + 2)));
 #pragma unroll
             for (int l = 0; l < NL; ++l) {
                 const float2 dm = (l & 2) ? dm2 : dm0;
-                const float  c  = cs[(l & 1) + ((l & 4) >> 1) + ((l & 8) >> 1)];
+                const float  c  = cs[qpn_csi(l)];
                 D[l] += c * (dm.x * (Ds[l >> 3][0].x[l & 7] + Ds[l >> 3][1].x[l & 7]) - 32.0f*dm.y * M[l >> 3].x[l & 7]);
             }
         } else if constexpr (type == GGML_TYPE_Q6_K || type == GGML_TYPE_Q3_K) {
@@ -1283,7 +1294,7 @@ static __device__ __forceinline__ void qpn_stream_loop(
 #pragma unroll
             for (int l = 0; l < NL; ++l) {
                 const float d = (l & 2) ? d02.y : d02.x;
-                const float c = cs[(l & 1) + ((l & 4) >> 1) + ((l & 8) >> 1)];
+                const float c = cs[qpn_csi(l)];
                 D[l] += c * d * (Ds[l >> 3][0].x[l & 7] + Ds[l >> 3][1].x[l & 7]);
             }
         } else if constexpr (type == GGML_TYPE_IQ4_XS) {
@@ -1291,13 +1302,13 @@ static __device__ __forceinline__ void qpn_stream_loop(
             const float d2 = __low2float(qpn_u2h(__shfl_sync(0xFFFFFFFF, tl.x, r0 + 2)));
 #pragma unroll
             for (int l = 0; l < NL; ++l) {
-                const float c = cs[(l & 1) + ((l & 4) >> 1) + ((l & 8) >> 1)];
+                const float c = cs[qpn_csi(l)];
                 D[l] += c * ((l & 2) ? d2 : d0) * (Ds[l >> 3][0].x[l & 7] + Ds[l >> 3][1].x[l & 7]);
             }
         } else {
 #pragma unroll
             for (int l = 0; l < NL; ++l) {
-                const float c = cs[(l & 1) + ((l & 4) >> 1) + ((l & 8) >> 1)];
+                const float c = cs[qpn_csi(l)];
                 D[l] += c * (Ds[l >> 3][0].x[l & 7] + Ds[l >> 3][1].x[l & 7]);
             }
         }
@@ -1363,7 +1374,7 @@ static __device__ __forceinline__ void qpn_mul_block(const int bx,
     const int  nB   = min(tile_B::get_i(0), t - 1); // token of this lane's B fragment (a real one for lanes of padding)
     const bool hasB = true;
     const int  r0   = lane & ~2;          // rows of this lane's C: r0, r0 + 2 (tile_C::get_i)
-    const int  c0   = lane & 2;           // its columns: c0 + (l & 13) (tile_C::get_j; l & 8 is the second B tile)
+    const int  c0   = lane & 2;           // its columns: c0 + qpn_col(l) (tile_C::get_j; l >> 3 is the B tile)
 
     float    D[NL] = {0.0f};
     unsigned bad   = 0;
@@ -1458,7 +1469,7 @@ static __device__ __forceinline__ void qpn_mul_block(const int bx,
 #pragma unroll
         for (int l = 0; l < NL; ++l) {
             const int row = tile*32 + r0 + (l & 2);
-            const int col = c0 + (l & 13);
+            const int col = c0 + qpn_col(l);
             if (P > 1) {
                 wsp[l*WARP_SIZE + lane] = D[l];
             } else if (col < t && (!CLIP || r0 + (l & 2) < nrow)) {
@@ -1467,14 +1478,14 @@ static __device__ __forceinline__ void qpn_mul_block(const int bx,
         }
     }
     if (badmask) { // block-uniform: those columns again, in fp32 from the dequantized weights
-        float fb[16];
+        float fb[QPN_FB_N];
         if (active) {
             // the split's bounds again, from a fresh read of blockIdx.y, so the loop's copies are not live across the call
             unsigned py;
             asm volatile("mov.u32 %0, %%ctaid.y;" : "=r"(py));
             qpn_fallback<type>(Wt, nsb*(int) py/P + sp, nsb*((int) py + 1)/P, S, badmask, t, x, stride_col_x, fb);
         } else {
-            for (int c = 0; c < 16; ++c) {
+            for (int c = 0; c < QPN_FB_N; ++c) {
                 fb[c] = 0.0f;
             }
         }
@@ -1494,7 +1505,7 @@ static __device__ __forceinline__ void qpn_mul_block(const int bx,
                 }
 #pragma unroll
                 for (int l = 0; l < NL; ++l) {
-                    if (c0 + (l & 13) == c) {
+                    if (c0 + qpn_col(l) == c) {
                         float v = 0.0f;
                         for (int i = 0; i < S; ++i) {
                             v += red[(wy + i)*WARP_SIZE + r0 + (l & 2)];
@@ -1539,7 +1550,7 @@ static __device__ __forceinline__ void qpn_mul_block(const int bx,
             v += __ldcg(ws0 + (i*NL + l)*WARP_SIZE + lane);
         }
         const int row = tile*32 + r0 + (l & 2);
-        const int col = c0 + (l & 13);
+        const int col = c0 + qpn_col(l);
         if (col < t) {
             dst[col*stride_col_dst + row] = v;
         }
@@ -1575,7 +1586,7 @@ static __device__ __forceinline__ void qpn_block_start(const half * __restrict__
     __syncthreads();
 }
 
-template <int T, int MODE> static constexpr __host__ __device__ bool qpn_wide() { return (T == 8 || T == 16) && MODE != 0; }
+template <int T, int MODE> static constexpr __host__ __device__ bool qpn_wide() { return (T == 8 || T == 16 || T == 32) && MODE != 0; }
 // PAIR: the paired 8-token blocks are their own instantiation, so every other kernel keeps one token count
 // (t, which is also the stride): with the pairing a run-time branch, t and ts were two values in every 8-token kernel (Q5_K down,
 // 8 tokens, 55.6 -> 61.0 us with the pairing)
@@ -1806,11 +1817,18 @@ bool ggml_cuda_qpn_launch(const int T, const bool stage, const int mode, const d
         case 7: return ggml_cuda_qpn_launch_t<type, 7>(stage, mode, grid, block, smem, stream, a);
         case 8: return ggml_cuda_qpn_launch_t<type, 8>(stage, mode, grid, block, smem, stream, a);
         default: {
+            int device;
+            CUDA_CHECK(cudaGetDevice(&device));
+            // [TAG_QPN_W32] 17 to 32 tokens, one kernel at T = 32 (four B tiles, the token count at run time), unstaged, one block
+            // of 8 warps per SM (MODE 1: the four tiles' accumulators take more than the 128 registers of two blocks)
+            if (T > 16) {
+                GGML_ASSERT(T <= 32 && !stage && a.nh == 1 && mode == 1);
+                return T == 32 && ggml_cuda_qpn_full_on() ? ggml_cuda_qpn_launch_m<type, 32, false, 1 + QPN_FULL>(device, grid, block, smem, stream, a, T)
+                                                          : ggml_cuda_qpn_launch_m<type, 32, false, 1>(device, grid, block, smem, stream, a, T);
+            }
             // 9 to 16 tokens, one kernel at T = 16 (two B tiles, the token count at run time), unstaged, 2 blocks of 8 warps per SM;
             // or (a.nh = 2) paired blocks of the kernel at T = 8, unstaged, at 3 blocks of 8 warps per SM
             GGML_ASSERT(T >= 9 && T <= 16 && !stage && (a.nh == 1 ? mode == 2 || mode == 5 : mode == 3));
-            int device;
-            CUDA_CHECK(cudaGetDevice(&device));
             const bool full = T == 16 && ggml_cuda_qpn_full_on();
             if (a.nh == 1 && mode == 5) {
                 return full ? ggml_cuda_qpn_launch_m<type, 16, false, 5 + QPN_FULL>(device, grid, block, smem, stream, a, T)

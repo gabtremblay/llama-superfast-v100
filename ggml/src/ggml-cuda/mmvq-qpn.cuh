@@ -17,25 +17,33 @@
 #define GGML_CUDA_QPN_ALL    (GGML_CUDA_QPN_Q5_K | GGML_CUDA_QPN_Q4_K | GGML_CUDA_QPN_Q6_K | GGML_CUDA_QPN_IQ4_XS | GGML_CUDA_QPN_IQ4_NL | \
                               GGML_CUDA_QPN_Q3_K | GGML_CUDA_QPN_Q8_0)
 
-// products of at most ggml_cuda_qpn_max_tokens() tokens run the tensor-core kernel (in passes of 16, each a read of the
-// weights); larger ones go to MMQ on the unrepacked weight or dequantize to fp16 for cuBLAS. LLAMA_QPN_MAX_TOKENS sets it, at
-// most GGML_CUDA_QPN_MAX_TOKENS (32 restores the old route); default GGML_CUDA_QPN_DEF_TOKENS
-#define GGML_CUDA_QPN_MAX_TOKENS 256
-#define GGML_CUDA_QPN_DEF_TOKENS 128
-static inline int ggml_cuda_qpn_max_tokens() {
-    static const int n = [] {
-        const char * e = getenv("LLAMA_QPN_MAX_TOKENS");
-        const int v = e ? atoi(e) : GGML_CUDA_QPN_DEF_TOKENS;
-        return v < 1 ? 1 : v > GGML_CUDA_QPN_MAX_TOKENS ? GGML_CUDA_QPN_MAX_TOKENS : v;
-    }();
-    return n;
-}
-
 // the widest pass of the tensor-core kernels: 16 tokens (two 8-token tiles over one read of the weights), or 8 with
 // LLAMA_QPN_W16=0 (the passes of 8, the pairs, the triple, the GDN a/b launch and the shared input at 1 to 8 tokens only, as before)
 static inline int ggml_cuda_qpn_pass_width() {
     static const int w = [] { const char * e = getenv("LLAMA_QPN_W16"); return e == nullptr || atoi(e) != 0 ? 16 : 8; }();
     return w;
+}
+// [TAG_QPN_W32] a single product's passes (ggml_cuda_mul_mat_qpn): 32 tokens (four 8-token tiles over one read of the weights,
+// each column bit-identical to a pass of 16), or the pass width with LLAMA_QPN_W32=0. The pairs, triples and shared inputs keep
+// ggml_cuda_qpn_pass_width(). Prompts of 68 / 90 / 113 tokens: 202 / 250 / 310 ms -> 168 / 199 / 240 (27B, one V100)
+static inline int ggml_cuda_qpn_single_width() {
+    static const int w = [] { const char * e = getenv("LLAMA_QPN_W32"); return e == nullptr || atoi(e) != 0 ? 32 : ggml_cuda_qpn_pass_width(); }();
+    return w;
+}
+
+// products of at most ggml_cuda_qpn_max_tokens() tokens run the tensor-core kernel (in passes of 32 or 16, each a read of the
+// weights); larger ones go to MMQ on the unrepacked weight or dequantize to fp16 for cuBLAS. LLAMA_QPN_MAX_TOKENS sets it, at
+// most GGML_CUDA_QPN_MAX_TOKENS (32 restores the old route); default 224 with passes of 32 (a 171-token prompt: 421 ms on MMQ ->
+// 361; at 245 tokens cuBLAS wins, 453 against 482), else GGML_CUDA_QPN_DEF_TOKENS
+#define GGML_CUDA_QPN_MAX_TOKENS 256
+#define GGML_CUDA_QPN_DEF_TOKENS 128
+static inline int ggml_cuda_qpn_max_tokens() {
+    static const int n = [] {
+        const char * e = getenv("LLAMA_QPN_MAX_TOKENS");
+        const int v = e ? atoi(e) : ggml_cuda_qpn_single_width() >= 32 ? 224 : GGML_CUDA_QPN_DEF_TOKENS;
+        return v < 1 ? 1 : v > GGML_CUDA_QPN_MAX_TOKENS ? GGML_CUDA_QPN_MAX_TOKENS : v;
+    }();
+    return n;
 }
 // t's rows are one run (each dimension above 1 strides by the one below), so a [K, tokens, sequences] input is
 // tokens*sequences columns: the GDN out projection's input with two slots ([6144, 8, 2]), which otherwise left the tensor cores

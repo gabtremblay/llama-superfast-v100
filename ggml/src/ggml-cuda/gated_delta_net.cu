@@ -714,12 +714,17 @@ static void ggml_cuda_op_gated_delta_net_impl(
         const char * e = getenv("LLAMA_GDN_CHUNKED");
         return e == nullptr || atoi(e) != 0;
     }();
+    // LLAMA_GDN_CHUNK_MIN: the fewest chunked tokens (default one whole chunk); the last chunk may be partial
+    static const int64_t chunk_min = [] {
+        const char * e = getenv("LLAMA_GDN_CHUNK_MIN");
+        return e ? std::max<int64_t>(1, atoll(e)) : (int64_t) GDN_CHUNK;
+    }();
     const int64_t n_tail = keep_rs ? std::min<int64_t>(K, n_tokens) : 0;
     const int     cc     = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     auto al16 = [](const void * ptr, int64_t s1, int64_t s2, int64_t s3) {
         return (uintptr_t) ptr % 16 == 0 && s1 % 4 == 0 && s2 % 4 == 0 && s3 % 4 == 0;
     };
-    if (chunked_on && !kda && S_v == GDN_CHUNK_D && n_tokens - n_tail >= GDN_CHUNK && H % neqk1 == 0 &&
+    if (chunked_on && !kda && S_v == GDN_CHUNK_D && n_tokens - n_tail >= chunk_min && H % neqk1 == 0 &&
         GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_VOLTA &&
         fd.q == nullptr && fd.alpha == nullptr && fd.beta == nullptr && fd.states == nullptr &&
         al16(q_d, sq1, sq2, sq3) && al16(k_d, sq1, sq2, sq3) && al16(v_d, sv1, sv2, sv3)) {

@@ -1075,8 +1075,9 @@ void ggml_cuda_mul_mat_qpn(ggml_backend_cuda_context & ctx, const ggml_tensor * 
         stride_col_dst == N && ggml_nelements(ctx.p2p_push_ar) == ggml_nelements(dst) && (uintptr_t) dst->data % 16 == 0 &&
         ggml_cuda_p2p_ar_push_target(ctx.p2p_push_ar, &push);
 
-    // passes of 16 tokens (LLAMA_QPN_W16=0: of 8, as before), so 9 to 16 tokens read the weights once
-    const int pw = ggml_cuda_qpn_pass_width();
+    // passes of 16 tokens (LLAMA_QPN_W16=0: of 8, as before), so 9 to 16 tokens read the weights once; of 32 with
+    // LLAMA_QPN_W32=1 [TAG_QPN_W32]
+    const int pw = ggml_cuda_qpn_single_width();
     for (int col0 = 0; col0 < ncols; ) {
         const int T = std::min(pw, ncols - col0);
         // by the weight's key (a slice under the split takes the whole weight's split); P stays within the slice's K.
@@ -1087,7 +1088,7 @@ void ggml_cuda_mul_mat_qpn(ggml_backend_cuda_context & ctx, const ggml_tensor * 
         int nh = 1;
         // not at exactly 16 tokens, where the kernel at T = 16 runs full (card 1, the slices, us: Q4_K down 85.2 paired ->
         // 73.0, Q4_K GDN out 28.2 -> 21.8)
-        if (T > 8 && ggml_cuda_qpn_pair16(src0->type, kn, kk) && !(T == 16 && ggml_cuda_qpn_full_on())) {
+        if (T > 8 && T <= 16 && ggml_cuda_qpn_pair16(src0->type, kn, kk) && !(T == 16 && ggml_cuda_qpn_full_on())) {
             const qpn_cfg c8 = ggml_cuda_qpn_config(src0->type, kn, kk, 8);
             if (!c8.stage && 2*ntiles <= QPN_MAX_TILES) {
                 c      = c8;
@@ -1097,13 +1098,18 @@ void ggml_cuda_mul_mat_qpn(ggml_backend_cuda_context & ctx, const ggml_tensor * 
         }
         // the lookahead of 4 units (MODE 5) for the single products of blocks of at most 4 warps (the split is the key's, so the
         // outputs are bit-identical)
-        if (T >= 5 && nh == 1 && !c.stage && c.S*c.R <= 4 && ggml_cuda_qpn_deep(src0->type, T)) {
+        if (T >= 5 && T <= 16 && nh == 1 && !c.stage && c.S*c.R <= 4 && ggml_cuda_qpn_deep(src0->type, T)) {
             c.mode = 5;
+        }
+        // [TAG_QPN_W32] 17 to 32 tokens: the 16-token split, unstaged, one block per SM
+        if (T > 16) {
+            c.stage = false;
+            c.mode  = 1;
         }
         c.P = std::max(1, std::min(c.P, nsb));
         const dim3 grid(nh*((ntiles + c.R - 1)/c.R), c.P), block(WARP_SIZE, c.S*c.R);
         const size_t smem = c.stage ? ggml_cuda_qpn_stage_bytes(nsb, c.P, T) : 0;
-        const int NL = T > 8 ? 16 : T > 4 ? 8 : 4;
+        const int NL = T > 16 ? 32 : T > 8 ? 16 : T > 4 ? 8 : 4;
 
         size_t sz_xh, sz_xs, sz_xsc;
         ggml_cuda_qpn_prep_sizes(K, T, sz_xh, sz_xs, sz_xsc);

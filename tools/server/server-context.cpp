@@ -4501,7 +4501,18 @@ private:
 
         common_set_adapter_lora(ctx_tgt, slot->lora);
         llama_set_embeddings(ctx_tgt, false);
-        llama_decode_job_set_layers(ctx_tgt, tu_policy.group);
+        // [TAG_TU_GROUP_ROWS] a group's time grows with the job's rows: tu_policy.group layers at a full ubatch, more for a
+        // shorter job, so its slices still fill the budget instead of paying a graph build and a sync per few layers
+        // (LLAMA_TU_GROUP_ROWS=0: tu_policy.group for every job)
+        static const bool group_rows = [] { const char * e = getenv("LLAMA_TU_GROUP_ROWS"); return e == nullptr || atoi(e) != 0; }();
+        {
+            const int32_t n_rows = std::max<int32_t>(1, batch_tu.size());
+            const int32_t n_ub   = (int32_t) llama_n_ubatch(ctx_tgt);
+            const int32_t n_lay  = llama_model_n_layer(model_tgt);
+            const int32_t layers = group_rows ? (int32_t) std::min<int64_t>(n_lay, (int64_t) tu_policy.group*std::max<int32_t>(1, n_ub/n_rows))
+                                              : tu_policy.group;
+            llama_decode_job_set_layers(ctx_tgt, layers);
+        }
 
         metrics_pre_decode();
 
@@ -5166,10 +5177,17 @@ private:
             return e ? atoi(e) : 512;
         }();
         const int32_t idle_rows = std::max<int32_t>(tu_peer_rows, idle_job_min);
+        // [TAG_TU_GEN_JOB_MIN] with a slot generating, a read of at most LLAMA_TU_GEN_JOB_MIN rows (default 256) joins the
+        // decode round's batch instead: as a job of 16 groups it paid a graph build and a sync per group (a 98-token prompt:
+        // 278 ms of service, 100 ms of it host time), while one joint pass costs the generating slots a single longer round
+        static const int32_t gen_job_min = [] {
+            const char * e = getenv("LLAMA_TU_GEN_JOB_MIN");
+            return e ? std::max(8, atoi(e)) : 256;
+        }();
         const bool tu_fill = tu_engaged && !tu_job.active && tu_pick != nullptr &&
             (tu_policy.force ||
              (tu_policy.fix
-                 ? (tu_remaining(*tu_pick) > (generating.empty() ? idle_rows : 8))
+                 ? (tu_remaining(*tu_pick) > (generating.empty() ? idle_rows : gen_job_min))
                  : !generating.empty()));
 
         // a reader's batch alone while a job lives (tu_read_other): its own limit
@@ -5738,7 +5756,14 @@ private:
                         slot.prompt.tokens.push_back(cur_tok);
 
                         // break at the last user message, or at user messages at least min step past the last checkpoint
-                        if (do_checkpoint && spans.is_user_start(slot.prompt.n_tokens())) {
+                        // [TAG_CKPT_USER_MIN] not before LLAMA_CKPT_USER_MIN tokens (default 256): a checkpoint there saves a
+                        // later prompt little (re-reading the short prefix folds into its first decode), and the break cost a fresh
+                        // short prompt a decode of its own, a full pass over the weights, plus a ~150 MiB recurrent-state checkpoint
+                        static const int32_t ckpt_user_min = [] {
+                            const char * e = getenv("LLAMA_CKPT_USER_MIN");
+                            return e ? std::max(0, atoi(e)) : 0;
+                        }();
+                        if (do_checkpoint && slot.prompt.n_tokens() >= ckpt_user_min && spans.is_user_start(slot.prompt.n_tokens())) {
                             const auto pos = slot.prompt.n_tokens();
                             const auto & checkpoints = slot.prompt.checkpoints;
 
