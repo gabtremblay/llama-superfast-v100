@@ -210,7 +210,7 @@ public:
     // sequences, aligned to 256. Two sequences share one cache there, so without it every prompt attended (masked) over the other
     // slot's cells too: a 24k prompt with 66k tokens in the other slot read at 550 instead of 915 t/s, and decode ran at 72-77
     // instead of 88-106 t/s. The scan of the cells costs less than a decode step saves. lo = 0, hi = n_kv_eff when it does not
-    // apply (kv_window off, several streams, or fewer than kv_window_min_tok tokens)
+    // apply (kv_window off, several streams, a ubatch of several sequences, or fewer than kv_window_min_tok tokens)
     void get_kv_window(const slot_info & sinfo, const llama_ubatch & ubatch, uint32_t n_kv_eff, uint32_t & lo, uint32_t & hi) const;
 
     // store k_cur and v_cur in the cache based on the provided head location

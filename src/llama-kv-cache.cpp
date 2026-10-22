@@ -1431,7 +1431,9 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
 void llama_kv_cache::get_kv_window(const slot_info & sinfo, const llama_ubatch & ubatch, uint32_t n_kv_eff, uint32_t & lo, uint32_t & hi) const {
     lo = 0;
     hi = n_kv_eff;
-    if (!kv_window || sinfo.n_stream() != 1 || ubatch.n_tokens < kv_window_min_tok || ubatch.n_seqs_unq == 0) {
+    // a ubatch of several sequences (both slots decoding) spans them all: its window saves nothing, and the scan and the graph
+    // shapes it changes cost ~4% of two-slot decode
+    if (!kv_window || sinfo.n_stream() != 1 || ubatch.n_tokens < kv_window_min_tok || ubatch.n_seqs_unq != 1) {
         return;
     }
 
