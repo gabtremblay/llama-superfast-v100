@@ -191,8 +191,8 @@ pool (`q8_0`, DFlash2).
   length in steps of 256, and the cache kept up to 512 graphs for 600 s.
 - The defaults are now 48 graphs for 120 s (`GGML_CUDA_GRAPH_MAX`, `GGML_CUDA_GRAPH_TTL_S`). A conversation moves to the
   next step every ~256 tokens, so old steps are rarely met again. Decode and TTFT are unchanged.
-- Growth over a BetterBench run is now +784 MiB (temporary-buffer pools plus the capped cache), which made room for
-  32k more tokens of context.
+- Growth over a long run of mixed agentic traffic is now +784 MiB (temporary-buffer pools plus the capped cache),
+  against ~2 GB with upstream's defaults, which made room for 32k more tokens of context.
 - Diagnostics: `GGML_CUDA_MEM_TRACE=1` logs every drop of free device memory of 8 MiB or more and where it happened
   (`=2` also per node); `GGML_CUDA_POOL_LOG=1` logs each pool growth; `GGML_CUDA_GRAPH_STATS=1` logs the cached graph
   count at the server's debug level.
