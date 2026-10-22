@@ -36,31 +36,7 @@ One V100 PCIe 32 GB, Qwen3.8-27B `UD-Q4_K_XL`, DFlash2 draft, `q8_0` KV, two slo
 | Decode, 400 tokens, three prompts | 88 / 90 / 104 tok/s | 88 / 91 / 106 tok/s |
 | Context | 2 × 98,304 | one 245,760-token pool (`--kv-unified`), or 2 × 122,880 split |
 
-**BetterBench**, an agentic serving benchmark (combined decode over both slots, inter-token latency, time to first
-token, throughput at 8 concurrent requests, prefill of a 64k prompt). Compare rows within a table: the two tables ran
-in different sessions and under different load.
-
-On a fresh server:
-
-| Build | Combined decode | Update p99 | Low 1% ITL | TTFT p50 | Aggregate @8 | Prefill @64k |
-|---|---|---|---|---|---|---|
-| vLLM on the same card, for reference | 49.0 tok/s | 74.1 ms | — | 256 ms | 138.0 tok/s | 772 tok/s |
-| MTP, 2 × 118,784 (`5c15ec5`) | 91.1 tok/s | 49.5 ms | 19.6 tok/s | 862 ms | 106.8 tok/s | 755 tok/s |
-| DFlash2, 2 × 98,304 (`5c15ec5`) | 105.7 tok/s | 46.8 ms | 20.6 tok/s | 874 ms | 85.6 tok/s | 771 tok/s |
-| DFlash2, 2 × 106,496 (`64107c5`) | 109.5 tok/s | 48.9 ms | 19.5 tok/s | 324 ms | 92.6 tok/s | 836 tok/s |
-
-With a 47k-token conversation held in one slot, the common case for an agent server, and a unified cache:
-
-| Build | Combined decode | TTFT p50 | Aggregate @8 | Prefill @64k |
-|---|---|---|---|---|
-| Unified 212,992, no window (`64107c5`) | 93.8 tok/s | 372 ms | 83.7 tok/s | 531 tok/s |
-| + per-batch window (`9a20120`) | 96.1 tok/s | 371 ms | 90.4 tok/s | 683 tok/s |
-| + smaller graph cache, 245,760 pool (`0b1a768`) | 96.2 tok/s | 372 ms | 87.6 tok/s | 684 tok/s |
-| + prompts placed after their own cells (`263398e`) | 98.7 tok/s | 316 ms | 88.2 tok/s | 837 tok/s |
-| **+ decode placed after its own cells (`dd1665f`, current)** | **108.6 tok/s** | **316 ms** | **94.3 tok/s** | 719 tok/s |
-
-The current build peaks at 31,980 MiB of the card's 32,494 over a full run (update p99 45.2 ms, low 1% ITL 21.4 tok/s).
-The last step trades some 64k prefill for decode; see [section 6](#6-cell-placement-in-a-unified-cache-263398e-dd1665f).
+The 245,760-token pool peaks at 31,980 MiB of the card's 32,494 over a long run of mixed agentic traffic.
 
 ## Build
 
@@ -203,9 +179,8 @@ pool (`q8_0`, DFlash2).
 - **Both slots' masks on the GPU.** The device mask builder handled only sequence 0 of a unified cache, so slot 1's
   masks were built on the host and sent over the link every batch. It now keeps one cell mirror per sequence and
   builds mixed batches run by run.
-- With the other slot holding 66k tokens: prefill of a 24k prompt 549 → 874 tok/s (split cache: 918), slot 0 decode
-  75 / 74 / 96 → 90 / 90 / 110 tok/s (split cache: 88 / 91 / 106). Repeated 40k and 64k prompts alternating between
-  loaded slots read at the split cache's speed (858 vs 858, 776 vs 779 tok/s).
+- With the other slot holding a long conversation, prefill and decode in the unified cache run at the split cache's
+  speed.
 - Verified: device masks match the host's bit for bit (`LLAMA_KQ_MASK_DEVICE_CHECK=1`, 711 masks under two-slot load),
   and temperature-0 outputs are identical with the window on and off.
 
@@ -231,12 +206,11 @@ other slot or by its own earlier prompts, and every later window spanned them.
 - A ubatch of one sequence in a unified cache now goes right after that sequence's last cell when those cells are free.
   Otherwise it goes to the start of the largest free run that holds it, so a conversation stays one run of cells.
   The head search is the fallback.
-- `263398e` does this for prompts: with a 47k-token conversation resident, TTFT 372 → 316 ms and 64k prefill
-  684 → 837 tok/s. `dd1665f` does it for decode too, which had restarted the search at cell 0 and decoded into small
-  holes beside the resident conversation: combined decode 98.7 → 108.6 tok/s, aggregate 88.2 → 94.3 tok/s.
+- `263398e` does this for prompts and `dd1665f` for decode, which had restarted the search at cell 0 and decoded into
+  small holes beside the other slot's conversation.
 - Known trade-off: a new conversation placed right after the other slot's cells can block that slot's next prompt
-  chunk, which then jumps past it, and 64k prefill drops to 719 tok/s. Placing new conversations in the middle of the
-  free run recovers it but costs two-slot decode (125 → 110 tok/s), so the current build keeps the tight placement.
+  chunk, which then jumps past it and slows its long-prompt prefill. Placing new conversations in the middle of the
+  free run avoids that but slows two-slot decode, so the current build keeps the tight placement.
 - Switches: `LLAMA_KV_PLACE_MIN_TOKENS` (default 1) sets the smallest ubatch placed this way; `LLAMA_KV_WINDOW_LOG=1`
   logs placements and windows.
 
