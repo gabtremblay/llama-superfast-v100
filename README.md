@@ -1,8 +1,8 @@
 # llama-superfast-v100-q8-inscora
 
 A fork of [bitexploder/llama-superfast-v100](https://github.com/bitexploder/llama-superfast-v100), the llama.cpp fork
-tuned for the Tesla V100 (Volta, `sm_70`), created for **one V100 card**, a single user, and two concurrent slots on a
-unified KV cache, to make agentic work palatable while maximizing context size. It adds:
+tuned for the Tesla V100 (Volta, `sm_70`), created for **one V100 card**, a **single user**, and **two concurrent slots** on a
+**unified KV cache**, to make agentic work palatable while maximizing context size. It adds:
 
 - an 8-bit (`q8_0`) KV cache on upstream's fast Volta attention kernels, so one 32 GB card holds about two thirds more
   context at the same speed;
