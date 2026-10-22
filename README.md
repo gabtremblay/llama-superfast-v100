@@ -4,8 +4,8 @@ A fork of [bitexploder/llama-superfast-v100](https://github.com/bitexploder/llam
 tuned for the Tesla V100 (Volta, `sm_70`), created for **one V100 card**, a **single user**, and **two concurrent slots** on a
 **unified KV cache**, to make agentic work palatable while maximizing context size. It adds:
 
-- an 8-bit (`q8_0`) KV cache on upstream's fast Volta attention kernels, so one 32 GB card holds about two thirds more
-  context at the same speed;
+- an 8-bit (`q8_0`) KV cache on upstream's fast Volta attention kernels, which with the memory changes below nearly
+  doubles the context one 32 GB card holds, for 2–3% of decode speed;
 - a unified KV cache (`--kv-unified`) that runs at the split cache's speed, so two slots share one 245,760-token pool;
 - faster prefill on upstream's repacked weights;
 - prompt work (DFlash2 features, checkpoints, masks) that stays on the GPU instead of crossing the host link;
@@ -24,17 +24,20 @@ insurance services to your clients, have a look at [inscora.com](https://inscora
 
 ## Results
 
-One V100 PCIe 32 GB, Qwen3.8-27B `UD-Q4_K_XL`, DFlash2 draft, `q8_0` KV, two slots.
+One V100 PCIe 32 GB, Qwen3.8-27B `UD-Q4_K_XL`, DFlash2 draft, two slots, `--cache-ram 0`, measured in one session.
+Upstream is [bitexploder/llama-superfast-v100](https://github.com/bitexploder/llama-superfast-v100) at `403f06f` with its
+f16 KV cache and its recipe (`-b 4096 -ub 2048`), at the largest two-slot context it fits with the DFlash2 draft. This
+fork runs the [Run](#run) line below.
 
-**Against upstream's routes** (the same build with this fork's prefill and GPU-residency changes switched off):
-
-| | Upstream routes + q8 KV | This fork |
+| | Upstream, f16 KV | This fork, `q8_0` KV |
 |---|---|---|
-| Cold prefill, 34k-token prompt | 832 tok/s | 892 tok/s |
-| Cold prefill, 5.6k-token prompt | 760 tok/s | 851 tok/s |
-| Time to first token, new ~125-token chat turn (median) | 828 ms | 680 ms, 430 ms with `--cache-ram 0` |
-| Decode, 400 tokens, three prompts | 88 / 90 / 104 tok/s | 88 / 91 / 106 tok/s |
-| Context | 2 × 98,304 | one 245,760-token pool (`--kv-unified`), or 2 × 122,880 split |
+| Cold prefill, ~8k-token prompt | 880 tok/s | 980 tok/s |
+| Cold prefill, ~48k-token prompt | 797 tok/s | 837 tok/s |
+| Time to first token, new ~125-token chat turn (median) | 657 ms | 429 ms |
+| Decode, 400 tokens, three prompts | 95 / 93 / 99 tok/s | 92 / 91 / 97 tok/s |
+| Context | 2 × 65,536 | one 245,760-token pool (`--kv-unified`) |
+
+Decode is 2–3% slower, the cost of reading an 8-bit cache, in exchange for 1.9× the context.
 
 The 245,760-token pool peaks at 31,980 MiB of the card's 32,494 over a long run of mixed agentic traffic.
 
@@ -137,8 +140,8 @@ over a temporary f16 copy of the cache.
 - Switches: `LLAMA_FA_GQA6_Q8=0` and `LLAMA_FATTN_VERIFY_STREAM_Q8=0` fall back to the generic kernels;
   `LLAMA_FATTN_VERIFY_STREAM_Q8_KP` and `LLAMA_FATTN_VERIFY_STREAM_Q8_W` tune the verify kernel.
 
-With sections 3 and 5, this took the server from two slots of 73,728 tokens (f16 cache, MTP) to one 245,760-token
-pool (`q8_0`, DFlash2).
+With sections 3 and 5, this took the server from upstream's 2 × 65,536 tokens (f16 cache, DFlash2) to one
+245,760-token pool.
 
 ### 2. Faster prefill on repacked weights (`044ef3b`)
 
