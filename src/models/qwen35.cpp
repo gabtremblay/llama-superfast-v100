@@ -271,6 +271,7 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
 
     // under --split-mode tensor a prefill ubatch runs as two halves interleaved layer by layer (build_tbo)
     if (tbo_applies()) {
+        GGML_ASSERT(!(tu && tu_feat != nullptr) && "a prompt job's layer inputs are not captured under --split-mode tensor");
         build_tbo(inpL, inp, inp_pos, inp_out_ids, sections, il0, il1, to_saved);
         return;
     }
@@ -278,6 +279,15 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
     // MTP/NextN layers are loaded as extra decoder blocks but not executed in the main pass.
     for (int il = il0; il < il1; ++il) {
         res->t_layer_inp[il] = inpL;
+
+        // [TAG_TU_FEAT] a prompt job's group keeps the layer's input for the draft in the job's buffer; expanded first, so it
+        // reads a group's first input (a view of the saved residual) before the group's last node overwrites it
+        if (tu && tu_feat != nullptr && il < tu_feat_n && tu_feat[il] != nullptr) {
+            ggml_tensor * feat = tu_feat[il];
+            GGML_ASSERT(feat->ne[0] == n_embd && tu_feat_row0 + n_tokens <= feat->ne[1]);
+            ggml_tensor * dst = ggml_view_2d(ctx0, feat, n_embd, n_tokens, feat->nb[1], tu_feat_row0*feat->nb[1]);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, inpL, dst));
+        }
 
         ggml_tensor * inpSA = inpL;
 

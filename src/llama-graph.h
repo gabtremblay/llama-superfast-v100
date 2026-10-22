@@ -925,6 +925,12 @@ struct llm_graph_params {
     int32_t           tu_il_end   = 0;
     ggml_tensor *     tu_resid    = nullptr;
 
+    // [TAG_TU_FEAT] the job's layer-input buffers by layer id (tu_feat_n entries, nullptr: not captured) and the row of the
+    // ubatch's first token in them
+    ggml_tensor * const * tu_feat      = nullptr;
+    int32_t               tu_feat_n    = 0;
+    int64_t               tu_feat_row0 = 0;
+
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
@@ -991,7 +997,8 @@ struct llm_graph_params {
         }
 
         // equally shaped groups of other layers are other graphs
-        if (tu_mode != other.tu_mode || tu_il_begin != other.tu_il_begin || tu_il_end != other.tu_il_end || tu_resid != other.tu_resid) {
+        if (tu_mode != other.tu_mode || tu_il_begin != other.tu_il_begin || tu_il_end != other.tu_il_end || tu_resid != other.tu_resid ||
+                tu_feat != other.tu_feat || tu_feat_row0 != other.tu_feat_row0) {
             return false;
         }
 
@@ -1187,6 +1194,9 @@ struct llm_graph_context {
     const int32_t           tu_il_begin;
     const int32_t           tu_il_end;
     ggml_tensor *           tu_resid;
+    ggml_tensor * const *   tu_feat;
+    const int32_t           tu_feat_n;
+    const int64_t           tu_feat_row0;
 
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;

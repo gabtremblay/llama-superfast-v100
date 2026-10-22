@@ -1375,8 +1375,10 @@ bool llama_context::copy_layer_inp_dev(uint32_t slot, const ggml_tensor * dst, s
         return false;
     }
     ggml_tensor * src = layer_inp_dev_t[slot];
-    // dst's slice for this slot: [n_embd, n_rows], contiguous, at dst_offs; n_rows = the selection's size, or all of src's rows
-    const int64_t n_rows = layer_inp_dev_sel.empty() ? src->ne[1] : (int64_t) layer_inp_dev_sel.size();
+    // dst's slice for this slot: [n_embd, n_rows], contiguous, at dst_offs; n_rows = the selection's size, or all of the decode's
+    // layer_inp_dev_n rows (a prompt job's tu_feat holds n_batch rows, the decode's first layer_inp_dev_n of them)
+    const int64_t n_rows = layer_inp_dev_sel.empty() ? (int64_t) layer_inp_dev_n : (int64_t) layer_inp_dev_sel.size();
+    GGML_ASSERT(layer_inp_dev_n <= src->ne[1]);
     if (dst->type != src->type || !ggml_is_contiguous(src) || src->ne[2] != 1 || src->ne[3] != 1 || dst->ne[0] != src->ne[0] || dst->ne[1] != n_rows ||
             dst_offs + n_rows*src->nb[1] > ggml_nbytes(dst)) {
         return false;
@@ -1387,7 +1389,7 @@ bool llama_context::copy_layer_inp_dev(uint32_t slot, const ggml_tensor * dst, s
         while (i + n < n_rows && (layer_inp_dev_sel.empty() || layer_inp_dev_sel[i + n] == r0 + n)) {
             ++n;
         }
-        GGML_ASSERT(r0 >= 0 && r0 + n <= src->ne[1]);
+        GGML_ASSERT(r0 >= 0 && r0 + n <= layer_inp_dev_n);
         ggml_tensor s = *src;
         ggml_tensor d = *src;
         s.ne[1]    = n;
@@ -2575,7 +2577,10 @@ void llama_context::extract_ubatch_outputs(const llm_graph_result * res, const l
     }
 
     // [TAG_DFLASH2_FEAT_DEV] a one-ubatch decode of few tokens (a verify) keeps its layer inputs on the device
-    if (cparams.layer_inp_dev_rows > 0 && n_tokens_prev == 0 && ubatch.n_tokens == n_tokens_all &&
+    // [TAG_TU_FEAT] a prompt job's groups copied them to tu_feat; job_step hands those out at publish
+    if (tu_job_extract) {
+        // nothing: not the graph's layer inputs, and no host copy
+    } else if (cparams.layer_inp_dev_rows > 0 && n_tokens_prev == 0 && ubatch.n_tokens == n_tokens_all &&
             (int32_t) ubatch.n_tokens <= cparams.layer_inp_dev_rows) {
         layer_inp_dev_t.clear();
         layer_inp_dev_backend = nullptr;
@@ -2706,8 +2711,78 @@ bool llama_context::job_supported() const {
         const char * e = getenv("LLAMA_TU");
         return e == nullptr || atoi(e) != 0;
     }();
-    return env_on && memory && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && cparams.n_seq_max > 1 && !cparams.kv_unified &&
-        model.supports_layer_groups() && dynamic_cast<const llama_memory_hybrid *>(memory.get()) != nullptr;
+    // [TAG_TU_UNIFIED] a unified cache: only jobs of one ubatch (n_batch <= n_ubatch). The job's cells are chosen at
+    // job_begin and applied at its first group, with no other decode between; a later ubatch's planned cells would stay
+    // free for another sequence's find_slot to take until that ubatch is applied
+    if (!(env_on && memory && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && cparams.n_seq_max > 1 &&
+            (!cparams.kv_unified || cparams.n_batch <= cparams.n_ubatch) &&
+            model.supports_layer_groups() && dynamic_cast<const llama_memory_hybrid *>(memory.get()) != nullptr)) {
+        return false;
+    }
+    // [TAG_TU_FEAT] layer inputs (the DFlash2 draft's features) reach the draft from a job only on the device: every input is
+    // a layer's (not the output's), and the job's whole batch fits the device path's rows
+    for (size_t il = 0; il < cparams.embeddings_layer_inp.size(); ++il) {
+        if (cparams.embeddings_layer_inp[il] &&
+                (il >= model.hparams.n_layer() || cparams.layer_inp_dev_rows < (int32_t) cparams.n_batch)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool llama_context::tu_feat_any() const {
+    for (bool b : cparams.embeddings_layer_inp) {
+        if (b) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool llama_context::tu_feat_reserve() {
+    if (!tu_feat_any()) {
+        return true;
+    }
+    if (tu_feat_buf) {
+        return true;
+    }
+    const auto & lin = cparams.embeddings_layer_inp;
+    int32_t n_feat = 0;
+    for (bool b : lin) {
+        n_feat += b ? 1 : 0;
+    }
+    ggml_init_params ip = {
+        /*.mem_size   =*/ ggml_tensor_overhead()*(size_t) n_feat,
+        /*.mem_buffer =*/ NULL,
+        /*.no_alloc   =*/ true,
+    };
+    tu_feat_ctx.reset(ggml_init(ip));
+    tu_feat.assign(lin.size(), nullptr);
+    for (size_t il = 0; il < lin.size(); ++il) {
+        if (lin[il]) {
+            tu_feat[il] = ggml_new_tensor_2d(tu_feat_ctx.get(), GGML_TYPE_F32, model.hparams.n_embd, cparams.n_batch);
+            ggml_format_name(tu_feat[il], "tu_feat-%zu", il);
+        }
+    }
+    auto * dev = model.dev_layer(0);
+    ggml_backend_buffer_type_t buft = dev ? ggml_backend_dev_buffer_type(dev) : ggml_backend_cpu_buffer_type();
+    tu_feat_buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(tu_feat_ctx.get(), buft));
+    tu_feat_backend = nullptr;
+    for (auto & be : backends) {
+        if (ggml_backend_get_device(be.get()) == dev) {
+            tu_feat_backend = be.get();
+        }
+    }
+    if (!tu_feat_buf || tu_feat_backend == nullptr) {
+        LLAMA_LOG_ERROR("%s: failed to allocate the prompt jobs' layer inputs (%d layers)\n", __func__, n_feat);
+        tu_feat_buf.reset();
+        tu_feat.clear();
+        tu_feat_ctx.reset();
+        return false;
+    }
+    LLAMA_LOG_INFO("%s: %10s prompt jobs' layer inputs for the draft (LLAMA_TU) = %8.2f MiB, %d layers\n", __func__,
+            ggml_backend_buffer_name(tu_feat_buf.get()), ggml_backend_buffer_get_size(tu_feat_buf.get())/1024.0/1024.0, n_feat);
+    return true;
 }
 
 void llama_context::job_set_layers(int32_t n_layers) {
@@ -2805,10 +2880,9 @@ int32_t llama_context::job_begin(const llama_batch & batch_inp) {
             batch_inp.embd != nullptr || batch_inp.pos == nullptr || batch_inp.n_seq_id == nullptr || batch_inp.seq_id == nullptr) {
         why = "the batch";
     }
-    for (bool b : cparams.embeddings_layer_inp) {
-        if (b && why == nullptr) {
-            why = "layer-input outputs";
-        }
+    // [TAG_TU_FEAT] the layer inputs go to the job's own buffers
+    if (why == nullptr && !tu_feat_reserve()) {
+        why = "the layer inputs' buffers";
     }
     if (why != nullptr) {
         LLAMA_LOG_ERROR("%s: cannot begin a prompt job: %s\n", __func__, why);
@@ -2868,6 +2942,10 @@ int32_t llama_context::job_begin(const llama_batch & batch_inp) {
         t_compute_start_us = ggml_time_us();
     }
     n_queued_tokens += n;
+
+    // [TAG_LOGITS_DEFER] as decode() does before its reserve: the previous batch's rows were read when it was sampled, and
+    // its graph may be gone (a job right after the warmup decode read the warmup's output tensor, which had no buffer)
+    logits_dev = {};
 
     sched_reserve();
 
@@ -3095,8 +3173,10 @@ int32_t llama_context::job_step(int32_t n_groups) {
             continue;
         }
 
-        // the ubatch completed: its outputs go to the job's slot
+        // the ubatch completed: its outputs go to the job's slot (its layer inputs are in tu_feat already)
+        tu_job_extract = true;
         extract_ubatch_outputs(res, ubatch, J.n_outputs_prev, J.n_tokens_prev, J.n_outputs_all, J.n_tokens_all);
+        tu_job_extract = false;
 
         // [TAG_LOGITS_DEFER] the graph outputs are reused by other decodes before the job's outputs are read: copy them now
         if (logits_dev.t != nullptr) {
@@ -3122,6 +3202,18 @@ int32_t llama_context::job_step(int32_t n_groups) {
             output_map(*J.balloc);
             publish = true;
             ret = LLAMA_DECODE_JOB_BATCH_DONE;
+
+            // [TAG_TU_FEAT] the job's layer inputs, all its rows, are what the draft's injection copies from next
+            if (!tu_feat.empty()) {
+                layer_inp_dev_t.clear();
+                for (ggml_tensor * t : tu_feat) {
+                    if (t != nullptr) {
+                        layer_inp_dev_t.push_back(t);
+                    }
+                }
+                layer_inp_dev_backend = tu_feat_backend;
+                layer_inp_dev_n       = (int32_t) J.n_tokens_all;
+            }
         } else {
             ret = LLAMA_DECODE_JOB_UBATCH_DONE;
         }
@@ -3228,6 +3320,8 @@ bool llama_context::tu_out_reserve() {
     if (!job_supported() || tu_job.active) {
         return false;
     }
+    // [TAG_TU_FEAT] the layer inputs' buffers at load too, not at the first job
+    tu_feat_reserve();
     if (!tu_out_reserve_on()) {
         LLAMA_LOG_WARN("%s: output slots reserved once (LLAMA_TU_OUT_RESERVE): off; decode-sized batches stay on sched_inj after the first job (LLAMA_TU_INJ_DECODE): %s\n",
                 __func__, tu_inj_decode() ? "on" : "off");
@@ -4038,6 +4132,9 @@ llm_graph_params llama_context::graph_params(
         /*.tu_il_begin     =*/ tu_graph.il0,
         /*.tu_il_end       =*/ tu_graph.il1,
         /*.tu_resid        =*/ tu_graph.mode != LLM_GRAPH_TU_NONE ? tu_resid : nullptr,
+        /*.tu_feat         =*/ tu_graph.mode != LLM_GRAPH_TU_NONE && !tu_feat.empty() ? tu_feat.data() : nullptr,
+        /*.tu_feat_n       =*/ tu_graph.mode != LLM_GRAPH_TU_NONE ? (int32_t) tu_feat.size() : 0,
+        /*.tu_feat_row0    =*/ tu_graph.mode != LLM_GRAPH_TU_NONE ? (int64_t) tu_job.n_tokens_prev : 0,
     };
 }
 

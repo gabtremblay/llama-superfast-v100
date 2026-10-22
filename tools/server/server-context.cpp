@@ -1814,7 +1814,8 @@ private:
             if (tu_policy.on && !tu_engaged) {
                 LOG_WRN("two-user scheduling (LLAMA_TU): not engaged: %s\n",
                         params_base.n_parallel <= 1 ? "one slot" : mctx != nullptr ? "multimodal" :
-                        "the model has no layer groups or the context cannot run jobs (one sequence, unified KV cache)");
+                        "the model has no layer groups or the context cannot run jobs (one sequence; a unified KV cache with "
+                        "-b > -ub; a draft's layer inputs off the device path or with -b > its rows)");
             }
             if (tu_capable) {
                 llama_decode_job_set_layers(ctx_tgt, tu_policy.group);

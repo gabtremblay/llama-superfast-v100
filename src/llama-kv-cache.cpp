@@ -1468,13 +1468,14 @@ const llama_kv_cells & llama_kv_cache::get_cells(llama_seq_id seq_id) const {
     return v_cells[seq_to_stream[seq_id]];
 }
 
+// [TAG_TU_UNIFIED] only the sequence's own cells: in a unified cache the stream also holds the other slots' cells, which
+// their decodes between the job's groups add and remove
 uint64_t llama_kv_cache::tu_seq_hash(llama_seq_id seq_id) const {
     const auto & cells = get_cells(seq_id);
     uint64_t h = 1469598103934665603ULL;
     auto mix = [&](uint64_t v) { h = (h ^ v) * 1099511628211ULL; };
-    mix(cells.get_used());
     for (uint32_t i = cells.used_min(); i < cells.used_max_p1(); ++i) {
-        if (cells.is_empty(i)) {
+        if (cells.is_empty(i) || !cells.seq_has(i, seq_id)) {
             continue;
         }
         mix(i);

@@ -488,6 +488,18 @@ private:
     ggml_tensor *           tu_resid  = nullptr; // f32 [n_embd, n_ubatch], the residual between a ubatch's groups
     int32_t                 tu_layers = 4;
 
+    // [TAG_TU_FEAT] a prompt job's layer inputs (the DFlash2 draft's features): one f32 [n_embd, n_batch] per enabled layer,
+    // indexed by layer id (nullptr: not enabled). The job's groups copy each enabled layer's input there, and at publish they
+    // become the layer_inp_dev_* the draft's injection copies from, as a one-ubatch decode's compute tensors are otherwise
+    ggml_context_ptr           tu_feat_ctx;
+    ggml_backend_buffer_ptr    tu_feat_buf;
+    std::vector<ggml_tensor *> tu_feat;
+    ggml_backend_t             tu_feat_backend = nullptr;
+    bool                       tu_job_extract  = false; // extract_ubatch_outputs is called from job_step
+
+    bool tu_feat_any() const; // a layer input is enabled
+    bool tu_feat_reserve();   // allocates tu_feat for the enabled layers, once
+
     // the layer range of the graph being built (graph_params)
     struct {
         llm_graph_tu_mode mode = LLM_GRAPH_TU_NONE;

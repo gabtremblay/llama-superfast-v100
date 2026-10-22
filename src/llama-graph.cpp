@@ -1402,7 +1402,8 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
     if (t_h_nextn != nullptr) {
         ggml_set_output(t_h_nextn);
     }
-    {
+    // [TAG_TU_FEAT] a prompt job's group copies its layers' inputs to the job's buffers instead (tu_feat)
+    if (params.tu_mode == LLM_GRAPH_TU_NONE) {
         const auto & embeddings_layer_inp = params.cparams.embeddings_layer_inp;
         for (size_t il = 0; il < embeddings_layer_inp.size(); ++il) {
             if (embeddings_layer_inp[il]) {
@@ -1529,6 +1530,9 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     tu_il_begin      (params.tu_il_begin),
     tu_il_end        (params.tu_il_end),
     tu_resid         (params.tu_resid),
+    tu_feat          (params.tu_feat),
+    tu_feat_n        (params.tu_feat_n),
+    tu_feat_row0     (params.tu_feat_row0),
     ctx0             (res->get_ctx()),
     gf               (res->get_gf()) {
         res->set_params(params);
