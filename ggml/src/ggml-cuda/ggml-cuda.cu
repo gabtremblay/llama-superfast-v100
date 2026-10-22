@@ -3376,6 +3376,38 @@ static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_c
 }
 #endif // USE_CUDA_GRAPH
 
+
+// GGML_CUDA_MEM_TRACE=1: every drop of the device's free memory of 8 MiB or more, with where it showed up: between graph
+// computes (an allocation outside the backend: a buffer, the staging buffer), in a graph compute, or after instantiating a CUDA
+// graph; =2 also after each node computed outside a capture. Diagnostics only (cudaMemGetInfo per check), never during a capture
+static int ggml_cuda_mem_trace() {
+    static const int v = [] { const char * e = getenv("GGML_CUDA_MEM_TRACE"); return e ? atoi(e) : 0; }();
+    return v;
+}
+static void ggml_cuda_mem_check(cudaStream_t stream, const char * where, const ggml_tensor * node, int64_t n_nodes) {
+    static size_t last = 0;
+    cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+    if (stream != nullptr && (cudaStreamIsCapturing(stream, &cs) != cudaSuccess || cs != cudaStreamCaptureStatusNone)) {
+        (void) cudaGetLastError();
+        return;
+    }
+    size_t f = 0, t = 0;
+    if (cudaMemGetInfo(&f, &t) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return;
+    }
+    if (last != 0 && last >= f + ((size_t) 8 << 20)) {
+        if (node != nullptr) {
+            fprintf(stderr, "cuda mem: -%zu MiB %s: %s %s [%lld, %lld, %lld] src0 %s (free %zu MiB)\n", (last - f) >> 20, where,
+                    ggml_op_desc(node), node->name, (long long) node->ne[0], (long long) node->ne[1], (long long) node->ne[2],
+                    node->src[0] ? ggml_type_name(node->src[0]->type) : "-", f >> 20);
+        } else {
+            fprintf(stderr, "cuda mem: -%zu MiB %s (%lld nodes) (free %zu MiB)\n", (last - f) >> 20, where, (long long) n_nodes, f >> 20);
+        }
+    }
+    last = f;
+}
+
 static bool ggml_cuda_should_fuse_rope_set_rows(const ggml_tensor * rope,
                                                 const ggml_tensor * view,
                                                 const ggml_tensor * set_rows) {
@@ -7629,6 +7661,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 cuda_ctx->p2p_push_ar = node->op == GGML_OP_MUL_MAT && !is_concurrent_event_active ? ggml_cuda_p2p_ar_of(cgraph, i) : nullptr;
                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
                 cuda_ctx->p2p_push_ar = nullptr;
+                if (ggml_cuda_mem_trace() >= 2) {
+                    ggml_cuda_mem_check(cuda_ctx->stream(), "after node", node, 0);
+                }
                 if (!ok) {
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
@@ -7694,6 +7729,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         if (graph->instance == nullptr) { // Create executable graph from captured graph.
             GGML_RT_SCOPE("cg.instantiate");
             CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
+            if (ggml_cuda_mem_trace() >= 1) {
+                ggml_cuda_mem_check(cuda_ctx->stream(), "after a CUDA graph instantiation", nullptr, cgraph->n_nodes);
+            }
         }
         if (cuda_graph_update_required) { // Update graph executable
             GGML_RT_SCOPE("cg.execupdate");
@@ -7726,7 +7764,20 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, ui
 }
 #endif // USE_CUDA_GRAPH
 
+static enum ggml_status ggml_backend_cuda_graph_compute_impl(ggml_backend_t backend, ggml_cgraph * cgraph);
+
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+    if (ggml_cuda_mem_trace() >= 1) {
+        ggml_cuda_set_device(((ggml_backend_cuda_context *) backend->context)->device);
+        ggml_cuda_mem_check(nullptr, "between graph computes", nullptr, cgraph->n_nodes);
+        const enum ggml_status st = ggml_backend_cuda_graph_compute_impl(backend, cgraph);
+        ggml_cuda_mem_check(nullptr, "in a graph compute", nullptr, cgraph->n_nodes);
+        return st;
+    }
+    return ggml_backend_cuda_graph_compute_impl(backend, cgraph);
+}
+
+static enum ggml_status ggml_backend_cuda_graph_compute_impl(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     GGML_RT_SCOPE("cuda.graph_compute");

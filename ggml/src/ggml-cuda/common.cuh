@@ -1497,14 +1497,16 @@ struct ggml_backend_cuda_context {
 #ifdef USE_CUDA_GRAPH
     std::unordered_map<uint64_t, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;
 
-    // [TAG_GRAPH_CACHE] at most GGML_CUDA_GRAPH_MAX entries (default 512), each evicted after GGML_CUDA_GRAPH_TTL_S seconds
-    // unused (default 600). An instantiated graph holds device memory: under mixed prompt lengths the 27B's cache filled over
-    // ~25 minutes and took ~2 GB, which a context sized by a fill test does not leave. GGML_CUDA_GRAPH_STATS=1 logs the count
-    // of entries and of instantiated graphs when it changes
+    // [TAG_GRAPH_CACHE] at most GGML_CUDA_GRAPH_MAX entries (default 48), each evicted after GGML_CUDA_GRAPH_TTL_S seconds
+    // unused (default 120). An instantiated graph of the 27B holds 8 MiB of device memory (GGML_CUDA_MEM_TRACE), and a decode
+    // graph is keyed by the cache length in steps of 256: under varied context lengths the old 512 entries for 600 s filled
+    // over ~25 minutes and took ~2 GB, which a context sized by a fill test does not leave (2 x 122,880 ran out of memory in
+    // BetterBench). A conversation moves to the next length step every ~256 tokens, so old steps are rarely met again: 48 for
+    // 120 s decode as fast. GGML_CUDA_GRAPH_STATS=1 logs the count of entries and of instantiated graphs when it changes
     static size_t graph_cache_max() {
         static const size_t n = [] {
             const char * e = getenv("GGML_CUDA_GRAPH_MAX");
-            const long v = e ? atol(e) : 512;
+            const long v = e ? atol(e) : 48;
             return (size_t) (v < 1 ? 1 : v);
         }();
         return n;
@@ -1512,7 +1514,7 @@ struct ggml_backend_cuda_context {
     static int64_t graph_cache_ttl_us() {
         static const int64_t t = [] {
             const char * e = getenv("GGML_CUDA_GRAPH_TTL_S");
-            const long v = e ? atol(e) : 600;
+            const long v = e ? atol(e) : 120;
             return (int64_t) (v < 1 ? 1 : v) * 1000000;
         }();
         return t;
