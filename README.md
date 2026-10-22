@@ -25,13 +25,11 @@ All of it is on the `q8-attention` branch, in four commits on top of upstream `4
   - The prefill kernel widens key blocks to f16 in shared memory.
   - The verify kernel has a `KVQ8` variant with 8-byte row loads and aligned windows.
   - Allocations no longer reserve the f16 copy for those routes.
-- Context: our server went from two slots of 73,728 tokens (f16 cache, MTP draft) to two slots of 106,496 (`q8_0`,
-  DFlash2 draft, with the VRAM change at the end of section 3). That size passes a full BetterBench run at a peak of
-  31.7–31.8 GB of the card's 32,494 MiB.
-  - A fill test (both slots full at once, then generation) passes up to 2 × 131,072. Under real mixed traffic, though,
-    VRAM keeps growing by about 2.7 GB over the first ~25 minutes before it plateaus. About 1.8 GB of that comes from
-    outside ggml's allocators, and it ran 2 × 122,880 out of memory. Size the context from a long mixed run, not a fill
-    test.
+- Context: our server went from two slots of 73,728 tokens (f16 cache, MTP draft) to one 245,760-token pool shared by
+  two slots (`q8_0`, DFlash2 draft, with the VRAM changes of sections 3 and 5). It passes a full BetterBench run at a
+  31.9 GB peak of the card's 32,494 MiB.
+  - Size a context from a long mixed run, not a fill test: VRAM keeps growing for the first ~25 minutes of real
+    traffic (section 5).
 - Tests: `q8_0` cases for both kernels in `test-backend-ops`, including the shapes the 27B uses.
 - Switches: `LLAMA_FA_GQA6_Q8=0` and `LLAMA_FATTN_VERIFY_STREAM_Q8=0` fall back to the generic kernels.
   `LLAMA_FATTN_VERIFY_STREAM_Q8_KP` and `LLAMA_FATTN_VERIFY_STREAM_Q8_W` tune the verify kernel.
@@ -101,6 +99,21 @@ All of it is on the `q8-attention` branch, in four commits on top of upstream `4
 - **Verified:** device masks match the host's bit for bit (`LLAMA_KQ_MASK_DEVICE_CHECK`, 711 masks under two-slot load).
   Temperature-0 outputs are identical with the window on and off.
 
+**5. A smaller CUDA graph cache: +32k tokens of context** (`0b1a768`)
+
+- **The cause.** Under real traffic VRAM grew ~2 GB over the first ~25 minutes, which no fill test showed. That ran
+  2 × 122,880 out of memory. `GGML_CUDA_MEM_TRACE` traced it to the CUDA graph cache:
+  - each instantiated graph of the 27B holds 8 MiB;
+  - decode graphs are keyed by the cache length in steps of 256;
+  - the cache kept up to 512 graphs for 600 s.
+- **The fix.** The defaults are now 48 graphs and 120 s (`GGML_CUDA_GRAPH_MAX`, `GGML_CUDA_GRAPH_TTL_S`). A conversation
+  moves to the next step every ~256 tokens, so old steps are rarely met again. Decode and TTFT are unchanged.
+- **The result.** Growth over a BetterBench run is +784 MiB (the temporary-buffer pools plus the capped cache), down from
+  ~2 GB. A unified pool of 245,760 tokens (the old 2 × 122,880 budget) passes BetterBench at a 31,952 MiB peak of the
+  card's 32,494.
+- `GGML_CUDA_MEM_TRACE=1` logs every drop of free device memory of 8 MiB or more and where it happened; `=2` also traces
+  per node.
+
 ## Measured (one V100 32 GB, eGPU, Qwen3.8-27B UD-Q4_K_XL, DFlash2, q8_0 KV, two slots)
 
 | | upstream route + q8 KV | this fork |
@@ -109,7 +122,7 @@ All of it is on the `q8-attention` branch, in four commits on top of upstream `4
 | Cold prefill, 5.6k-token prompt | 760 tok/s | 851 tok/s |
 | Time to first token, new ~125-token chat turn (median) | 828 ms | 680 ms, 430 ms with `--cache-ram 0` |
 | Decode, 400 tokens, three prompts | 88 / 90 / 104 tok/s | 88 / 91 / 106 tok/s |
-| Context | 2 × 98,304 | 2 × 106,496, or one 212,992-token pool (`--kv-unified`) |
+| Context | 2 × 98,304 | one 245,760-token pool (`--kv-unified`), or 2 × 122,880 split |
 
 The "upstream route" column is the same build with this fork's prefill and GPU-residency changes switched off.
 
@@ -131,6 +144,7 @@ night:
 |---|---|---|---|---|---|
 | Unified 212,992, before the window (`64107c5`) | 93.8 tok/s | 49.8 ms | 372 ms | 83.7 tok/s | 531 tok/s |
 | **Unified 212,992, with the window (`9a20120`)** | **96.1 tok/s** | 49.5 ms | 371 ms | **90.4 tok/s** | **683 tok/s** |
+| **Unified 245,760, release image (`0b1a768`)** | **96.2 tok/s** | 50.0 ms | 372 ms | 87.6 tok/s | **684 tok/s** |
 
 With `--kv-unified`, either slot can use most of the shared pool: one slot took a 157k-token prompt while the other still
 answered a side request. Since the window (section 4), decode, latency and prefill match the split cache, so unified is
@@ -147,15 +161,15 @@ LLAMA_TU=0 LLAMA_DFLASH2_HEAD_FILE=$MODELS/mtp-Qwen3.8-27B-Q4_0.gguf \
 LLAMA_SPEC_DRAFT_VOCAB_FILE=models/draft-vocab-qwen3.8-27b.txt \
 build/bin/llama-server -m $MODELS/Qwen3.8-27B-UD-Q4_K_XL.gguf \
   -md $MODELS/Qwen3.8-27B-DFlash2-Q4_K_M.gguf --spec-type draft-dflash --spec-draft-n-max 7 --spec-draft-ubatch 512 \
-  -c 212992 --parallel 2 --kv-unified -fa on -ngl 99 -ctk q8_0 -ctv q8_0 -ctkd f16 -ctvd f16 \
+  -c 245760 --parallel 2 --kv-unified -fa on -ngl 99 -ctk q8_0 -ctv q8_0 -ctkd f16 -ctvd f16 \
   -t 12 -b 2048 -ub 2048 --cache-ram 0 --jinja --temp 1.0 --top-p 0.95 --top-k 20
 ```
 
 - `LLAMA_TU=0` is required with DFlash2: the two-user scheduler rejects its long prompts.
 - `LLAMA_SPEC_DRAFT_VOCAB_FILE` restricts the draft to the 131k-token vocabulary subset. Without it, decode is ~5–10%
   slower. The Docker image sets it.
-- `--kv-unified`: one 212,992-token pool for both slots. With `--no-kv-unified`, each slot gets a fixed half
-  (2 × 106,496).
+- `--kv-unified`: one 245,760-token pool for both slots, peaking at 31.9 GB under BetterBench. With
+  `--no-kv-unified`, each slot gets a fixed half (2 × 122,880).
 - `LLAMA_DFLASH2_HEAD_FILE` points DFlash2's output head at the MTP file's rows.
 - `-b 2048` (equal to `-ub`) keeps the DFlash2 features on the GPU during prefill.
 
