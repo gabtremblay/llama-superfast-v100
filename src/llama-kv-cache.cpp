@@ -360,6 +360,8 @@ llama_kv_cache::llama_kv_cache(
         kv_window = (e == nullptr || atoi(e) != 0) && n_stream == 1 && n_seq_max > 1 && !v_trans &&
             (model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE);
         kv_window_min_tok = em ? (uint32_t) std::max(1, atoi(em)) : 1;
+        const char * ep = getenv("LLAMA_KV_PLACE_MIN_TOKENS");
+        kv_place_min_tok = ep ? (uint32_t) std::max(1, atoi(ep)) : 16;
     }
 
     // decode graphs over the whole cache. From whole_min used keys on, a ubatch of at most whole_max_tok tokens attends
@@ -1138,6 +1140,61 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
             return { };
         }
 
+        // [TAG_KV_WINDOW] a prompt ubatch of one sequence in a unified cache goes right after that sequence's last cell when
+        // those cells are free, else into the first free run that holds it whole, so the conversation stays one run of cells and
+        // its window (get_kv_window) stays tight. The head
+        // search below put a new turn after the cells freed from the slot's previous, longer prompt, so the window spanned the
+        // freed hole: with a 47k-token prompt gone, a 80-token turn and its decode read ~47k empty cells (TTFT +60 ms, code
+        // decode 124 -> 101 t/s). Decode ubatches keep the head search: it continues right after their prompt
+        if (kv_window && !cont && n_stream == 1 && ubatch.n_seqs_unq == 1 && n_tokens >= kv_place_min_tok) {
+            const llama_seq_id sq = ubatch.seq_id_unq[0];
+            int64_t last = -1;
+            for (uint32_t j = cells.used_max_p1(); j-- > 0; ) {
+                if (!cells.is_empty(j) && cells.seq_has(j, sq)) {
+                    last = j;
+                    break;
+                }
+            }
+            static const bool plog = getenv("LLAMA_KV_WINDOW_LOG") != nullptr;
+            if (plog) {
+                fprintf(stderr, "kv place: seq %d, %u tokens, pos %d.., last cell %lld (pos %d), used_max_p1 %u, head %u\n", sq, n_tokens,
+                        ubatch.pos ? ubatch.pos[0] : -1, (long long) last, last >= 0 ? cells.pos_get((uint32_t) last) : -1,
+                        cells.used_max_p1(), v_heads[seq_to_stream[seq_id]]);
+            }
+            if (last >= 0 && (uint64_t) last + 1 + n_tokens <= cells.size()) {
+                bool free = true;
+                for (uint32_t j = (uint32_t) last + 1; j < (uint32_t) last + 1 + n_tokens; ++j) {
+                    if (!cells.is_empty(j)) {
+                        free = false;
+                        break;
+                    }
+                }
+                if (free) {
+                    for (uint32_t j = 0; j < n_tokens; ++j) {
+                        res.idxs[s].push_back((uint32_t) last + 1 + j);
+                    }
+                    continue;
+                }
+            }
+            // else the first run of free cells that holds the whole ubatch: the head search fills holes token by token, so a new
+            // conversation's first 42 tokens went 36 into a hole at the bottom and 6 past the other slot's 47k cells, and every
+            // window of it spanned them
+            uint32_t run = 0;
+            for (uint32_t j = 0; j < cells.size(); ++j) {
+                run = cells.is_empty(j) ? run + 1 : 0;
+                if (run == n_tokens) {
+                    for (uint32_t k = j + 1 - n_tokens; k <= j; ++k) {
+                        res.idxs[s].push_back(k);
+                    }
+                    break;
+                }
+            }
+            if (res.idxs[s].size() == n_tokens) {
+                continue;
+            }
+            res.idxs[s].clear();
+        }
+
         uint32_t n_tested = 0;
 
         // for continuous slots, we test that all tokens in the ubatch fit, starting from the current head
@@ -1461,6 +1518,24 @@ void llama_kv_cache::get_kv_window(const slot_info & sinfo, const llama_ubatch &
     const uint32_t a = std::max(n_pad, 256u);
     const uint32_t l = mn / a * a;
     const uint32_t h = std::min(n_kv_eff, GGML_PAD(mx + 1, a));
+
+    // LLAMA_KV_WINDOW_LOG: a wide window's runs of the sequence's cells (start-end:first pos-last pos), at most 8
+    static const bool wlog = getenv("LLAMA_KV_WINDOW_LOG") != nullptr;
+    if (wlog && h - l >= 8192) {
+        const llama_seq_id sq = ubatch.seq_id_unq[0];
+        std::string runs;
+        int n_runs = 0;
+        for (uint32_t j = mn; j <= mx && n_runs < 8; ) {
+            if (cells.is_empty(j) || !cells.seq_has(j, sq)) { ++j; continue; }
+            uint32_t k = j;
+            while (k + 1 <= mx && !cells.is_empty(k + 1) && cells.seq_has(k + 1, sq)) { ++k; }
+            runs += " " + std::to_string(j) + "-" + std::to_string(k) + ":" + std::to_string(cells.pos_get(j)) + "-" + std::to_string(cells.pos_get(k));
+            if (cells.seq_count(j) > 1) { runs += "(shared)"; }
+            ++n_runs;
+            j = k + 1;
+        }
+        fprintf(stderr, "kv window wide: seq %d, %u tokens, cells%s\n", sq, ubatch.n_tokens, runs.c_str());
+    }
     if (h > l && (l > 0 || h < n_kv_eff)) {
         lo = l;
         hi = h;
@@ -3422,6 +3497,17 @@ bool llama_kv_cache_context::apply() {
         kv->get_kv_window(sinfo, ubatches[i_cur], n_kv_eff, lo, hi);
         kv_lo = lo;
         n_kv  = hi - lo;
+    }
+    // LLAMA_KV_WINDOW_LOG=1: each ubatch's window (every 50th decode-sized one)
+    {
+        static const bool wlog = getenv("LLAMA_KV_WINDOW_LOG") != nullptr;
+        static int n_small = 0;
+        const auto & ub = ubatches[i_cur];
+        if (wlog && (ub.n_tokens >= 64 || (n_small++ % 50) == 0)) {
+            fprintf(stderr, "kv window: %u tokens, %u seqs (first %d, cells of it [%u..]), window [%u, %u) of n_kv_eff %u, whole %d\n",
+                    ub.n_tokens, ub.n_seqs_unq, ub.n_seqs_unq ? ub.seq_id_unq[0] : -1, sinfo.idxs[0].empty() ? 0u : sinfo.idxs[0][0],
+                    kv_lo, kv_lo + (uint32_t) n_kv, n_kv_eff, (int) whole);
+        }
     }
 
     return true;
