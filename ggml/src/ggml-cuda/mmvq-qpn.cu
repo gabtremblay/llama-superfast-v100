@@ -60,8 +60,11 @@
 
 #include "mmvq-qpn-impl.cuh"
 
+#include <cmath>
+#include <cstring>
 #include <mutex>
 #include <string>
+#include <vector>
 
 // LLAMA_QPN_BENCH=N: the first direct (uncaptured) launch of each distinct key is repeated N times back to back and timed
 static int qpn_bench_reps() {
@@ -602,6 +605,11 @@ static qpn_cfg ggml_cuda_qpn_config(const ggml_type type, const int64_t n, const
     }
     if (T <= 4 && c.mode == 2 && !c.stage) {
         c.mode = 3;
+    }
+    // at 1 to 4 tokens there is no MODE 5 kernel: ggml_cuda_qpn_launch_t runs the whole-superblock kernel (MODE 0) for it, so say
+    // so (a sweep's "mode 5" at 4 tokens was MODE 0)
+    if (T <= 4 && c.mode == 5) {
+        c.mode = 0;
     }
     return c;
 }
@@ -1248,21 +1256,72 @@ void ggml_cuda_mul_mat_qpn(ggml_backend_cuda_context & ctx, const ggml_tensor * 
             CUDA_CHECK(cudaMemsetAsync(a.xsc, 0, sz_xsc, stream));
         }
 
-        auto launch = [&]() {
+        auto launch_c = [&](const int mode, const dim3 g, const dim3 b) {
             switch (src0->type) {
-                case GGML_TYPE_Q4_K: return ggml_cuda_qpn_launch<GGML_TYPE_Q4_K>(T, c.stage, c.mode, grid, block, smem, stream, a);
-                case GGML_TYPE_Q5_K: return ggml_cuda_qpn_launch<GGML_TYPE_Q5_K>(T, c.stage, c.mode, grid, block, smem, stream, a);
-                case GGML_TYPE_Q6_K: return ggml_cuda_qpn_launch<GGML_TYPE_Q6_K>(T, c.stage, c.mode, grid, block, smem, stream, a);
-                case GGML_TYPE_IQ4_XS: return ggml_cuda_qpn_launch<GGML_TYPE_IQ4_XS>(T, c.stage, c.mode, grid, block, smem, stream, a);
-                case GGML_TYPE_IQ4_NL: return ggml_cuda_qpn_launch<GGML_TYPE_IQ4_NL>(T, c.stage, c.mode, grid, block, smem, stream, a);
-                case GGML_TYPE_Q3_K:   return ggml_cuda_qpn_launch<GGML_TYPE_Q3_K>(T, c.stage, c.mode, grid, block, smem, stream, a);
-                case GGML_TYPE_Q8_0:   return ggml_cuda_qpn_launch<GGML_TYPE_Q8_0>(T, c.stage, c.mode, grid, block, smem, stream, a);
+                case GGML_TYPE_Q4_K: return ggml_cuda_qpn_launch<GGML_TYPE_Q4_K>(T, c.stage, mode, g, b, smem, stream, a);
+                case GGML_TYPE_Q5_K: return ggml_cuda_qpn_launch<GGML_TYPE_Q5_K>(T, c.stage, mode, g, b, smem, stream, a);
+                case GGML_TYPE_Q6_K: return ggml_cuda_qpn_launch<GGML_TYPE_Q6_K>(T, c.stage, mode, g, b, smem, stream, a);
+                case GGML_TYPE_IQ4_XS: return ggml_cuda_qpn_launch<GGML_TYPE_IQ4_XS>(T, c.stage, mode, g, b, smem, stream, a);
+                case GGML_TYPE_IQ4_NL: return ggml_cuda_qpn_launch<GGML_TYPE_IQ4_NL>(T, c.stage, mode, g, b, smem, stream, a);
+                case GGML_TYPE_Q3_K:   return ggml_cuda_qpn_launch<GGML_TYPE_Q3_K>(T, c.stage, mode, g, b, smem, stream, a);
+                case GGML_TYPE_Q8_0:   return ggml_cuda_qpn_launch<GGML_TYPE_Q8_0>(T, c.stage, mode, g, b, smem, stream, a);
                 default: GGML_ABORT("fatal error");
             }
         };
+        auto launch = [&]() { return launch_c(c.mode, grid, block); };
         const bool pushed = launch();
         if (!pushing) {
             qpn_bench(key, ggml_nbytes(src0), stream, launch);
+        }
+        // [TAG_QPN_CHECK] LLAMA_QPN_CHECK="MODE[,R]" (off by default): the first direct launch of each key is recomputed at the same
+        // S, P and staging with that mode (and R row tiles a block, default the launched R) and the two outputs are compared bit for
+        // bit, so a kernel meant to sum in the same order as another is checked on the real weights and inputs. The launched output
+        // is kept. Single passes of 1 to 8 tokens only (the 9-32 token passes have one mode each; not the paired 8-token blocks,
+        // not under a capture)
+        if (!pushing && nh == 1 && T <= 8 && !key.empty()) {
+            // a third field, S, checks the checker: another split-K sums in another order, so it must report a difference
+            int cm = -1, cr = c.R, cs_ = c.S;
+            if (const char * e = getenv("LLAMA_QPN_CHECK")) {
+                sscanf(e, "%d,%d,%d", &cm, &cr, &cs_);
+            }
+            cudaStreamCaptureStatus cs;
+            CUDA_CHECK(cudaStreamIsCapturing(stream, &cs));
+            static std::mutex                      check_mu;
+            static std::unordered_set<std::string> check_seen;
+            bool first = false;
+            if (cm >= 0 && cs == cudaStreamCaptureStatusNone) {
+                std::lock_guard<std::mutex> lock(check_mu);
+                first = check_seen.insert(key).second;
+            }
+            if (first) {
+                cs_ = std::max(1, std::min(cs_, QPN_MAX_WARPS));
+                cr  = std::max(1, std::min(cr, QPN_MAX_WARPS / cs_));
+                const dim3 gref((ntiles + cr - 1)/cr, c.P), bref(WARP_SIZE, cs_*cr);
+                const int  s_launched = a.S;
+                a.S = cs_;
+                const size_t row = (size_t) N*sizeof(float), pitch = (size_t) stride_col_dst*sizeof(float);
+                ggml_cuda_pool_alloc<float> got(ctx.pool(), (size_t) N*T), ref(ctx.pool(), (size_t) N*T);
+                CUDA_CHECK(cudaMemcpy2DAsync(got.get(), row, a.dst, pitch, row, T, cudaMemcpyDeviceToDevice, stream));
+                launch_c(cm, gref, bref);
+                CUDA_CHECK(cudaGetLastError());
+                a.S = s_launched;
+                CUDA_CHECK(cudaMemcpy2DAsync(ref.get(), row, a.dst, pitch, row, T, cudaMemcpyDeviceToDevice, stream));
+                CUDA_CHECK(cudaMemcpy2DAsync(a.dst, pitch, got.get(), row, row, T, cudaMemcpyDeviceToDevice, stream));
+                std::vector<float> hg((size_t) N*T), hr((size_t) N*T);
+                CUDA_CHECK(cudaMemcpyAsync(hg.data(), got.get(), row*T, cudaMemcpyDeviceToHost, stream));
+                CUDA_CHECK(cudaMemcpyAsync(hr.data(), ref.get(), row*T, cudaMemcpyDeviceToHost, stream));
+                CUDA_CHECK(cudaStreamSynchronize(stream));
+                size_t nd = 0;
+                float  md = 0.0f;
+                for (size_t i = 0; i < hg.size(); ++i) {
+                    if (memcmp(&hg[i], &hr[i], sizeof(float)) != 0) {
+                        ++nd;
+                        md = std::max(md, std::fabs(hg[i] - hr[i]));
+                    }
+                }
+                fprintf(stderr, "qpn-check %s vs mode=%d R=%d S=%d : %s (%zu of %zu differ, max |diff| %g)\n", key.c_str(), cm, cr, cs_,
+                        nd == 0 ? "identical" : "DIFFERENT", nd, hg.size(), md);
+            }
         }
         if (pushed) {
             ctx.p2p_pushed = ctx.p2p_push_ar;
