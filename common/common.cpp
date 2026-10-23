@@ -4,6 +4,7 @@
 
 #include "build-info.h"
 #include "common.h"
+#include <atomic>
 #include <mutex>
 #include <set>
 #include <thread>
@@ -2524,12 +2525,12 @@ common_prompt_checkpoint::~common_prompt_checkpoint() {
 common_prompt_checkpoint::common_prompt_checkpoint(const common_prompt_checkpoint & other) {
     other.wait_tgt();
     n_tokens = other.n_tokens; id_task = other.id_task; pos_min = other.pos_min; pos_max = other.pos_max;
-    data_tgt = other.data_tgt; data_dft = other.data_dft; data_spec = other.data_spec;
+    data_tgt = other.data_tgt; data_dft = other.data_dft; data_spec = other.data_spec; uid = other.uid;
 }
 
 common_prompt_checkpoint::common_prompt_checkpoint(common_prompt_checkpoint && other) noexcept :
     n_tokens(other.n_tokens), id_task(other.id_task), pos_min(other.pos_min), pos_max(other.pos_max),
-    data_tgt(std::move(other.data_tgt)), data_dft(std::move(other.data_dft)), data_spec(std::move(other.data_spec)),
+    data_tgt(std::move(other.data_tgt)), data_dft(std::move(other.data_dft)), data_spec(std::move(other.data_spec)), uid(other.uid),
     pending_tgt(other.pending_tgt) {
     other.pending_tgt = nullptr;
 }
@@ -2541,7 +2542,7 @@ common_prompt_checkpoint & common_prompt_checkpoint::operator=(const common_prom
         ckpt_recycle(data_tgt);
         ckpt_recycle(data_dft);
         n_tokens = other.n_tokens; id_task = other.id_task; pos_min = other.pos_min; pos_max = other.pos_max;
-        data_tgt = other.data_tgt; data_dft = other.data_dft; data_spec = other.data_spec;
+        data_tgt = other.data_tgt; data_dft = other.data_dft; data_spec = other.data_spec; uid = other.uid;
     }
     return *this;
 }
@@ -2553,6 +2554,7 @@ common_prompt_checkpoint & common_prompt_checkpoint::operator=(common_prompt_che
         ckpt_recycle(data_dft);
         n_tokens = other.n_tokens; id_task = other.id_task; pos_min = other.pos_min; pos_max = other.pos_max;
         data_tgt = std::move(other.data_tgt); data_dft = std::move(other.data_dft); data_spec = std::move(other.data_spec);
+        uid = other.uid;
         pending_tgt = other.pending_tgt;
         other.pending_tgt = nullptr;
     }
@@ -2580,6 +2582,7 @@ void common_prompt_checkpoint::clear() {
     data_tgt.clear();
     data_dft.clear();
     data_spec.clear();
+    uid = 0;
 }
 
 void common_prompt_checkpoint::update_pos(
@@ -2605,6 +2608,9 @@ void common_prompt_checkpoint::update_tgt(
 
     ckpt_recycle(data_tgt);
     ckpt_take(0, data_tgt, ckpt_size);
+
+    static std::atomic<uint64_t> next_uid{1};
+    uid = next_uid++;
 
     const size_t n = llama_state_seq_get_data_ext(ctx, data_tgt.data(), ckpt_size, seq_id, flags);
     if (n != ckpt_size) {

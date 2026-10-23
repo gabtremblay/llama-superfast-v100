@@ -1228,6 +1228,10 @@ struct common_prompt_checkpoint {
     common_ckpt_bytes data_tgt;
     common_ckpt_bytes data_dft;
 
+    // [TAG_CKPT_DEV] a fresh id each time data_tgt is written (0: none), carried by copies and moves: the server's device copy of a
+    // restored checkpoint is keyed by it
+    uint64_t uid = 0;
+
     // (optional) speculative-decoding implementation state stashed with the checkpoint
     // (e.g. eagle3's deferred-boundary g_embd row)
     std::vector<uint8_t> data_spec;

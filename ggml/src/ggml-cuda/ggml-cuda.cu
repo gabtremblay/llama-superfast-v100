@@ -3220,13 +3220,40 @@ static bool ggml_cuda_is_view_or_noop(const ggml_tensor * t) {
 }
 
 #ifdef USE_CUDA_GRAPH
+// [TAG_CUDA_GRAPH_MAX_TOKENS] a graph whose products take more than GGML_CUDA_GRAPH_MAX_TOKENS tokens (default 64; 0: no limit)
+// runs directly, never captured: a prompt's graph is keyed by its shape, so each prompt length was captured and instantiated on its
+// second occurrence and seldom replayed (a 124-token prompt: 292 ms against 255 ms for the same length's direct or replayed
+// runs), and a prompt is GPU-bound, so launching its kernels directly costs it nothing
+static int64_t ggml_cuda_graph_max_tokens() {
+    static const int64_t n = [] { const char * e = getenv("GGML_CUDA_GRAPH_MAX_TOKENS"); return e ? (int64_t) atoll(e) : 64; }();
+    return n;
+}
+
 static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 
     bool use_cuda_graph = true;
     // Loop over nodes in GGML graph to obtain info needed for CUDA graph
 
+    const int64_t max_tokens = ggml_cuda_graph_max_tokens();
+
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
+
+        // the tokens are the src1 rows of a product with a weight (the attention's per-head products and the q8 cache's rotation of
+        // the queries, [256, tokens*heads], are not)
+        const ggml_tensor * w = node->op == GGML_OP_MUL_MAT ? (node->src[0]->view_src ? node->src[0]->view_src : node->src[0]) : nullptr;
+        if (max_tokens > 0 && w != nullptr && node->src[1] != nullptr && node->src[1]->ne[1] > max_tokens && w->buffer != nullptr &&
+                ggml_backend_buffer_get_usage(w->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+            static int n_logged = 0;
+            if (n_logged < 6 && getenv("GGML_CUDA_GRAPH_MAX_TOKENS_LOG") != nullptr) {
+                n_logged++;
+                GGML_LOG_WARN("%s: graph of %d nodes runs directly: %s [%lld, %lld, %lld] x %s [%lld, %lld, %lld]\n", __func__, cgraph->n_nodes,
+                        node->src[0]->name, (long long) node->src[0]->ne[0], (long long) node->src[0]->ne[1], (long long) node->src[0]->ne[2],
+                        node->src[1]->name, (long long) node->src[1]->ne[0], (long long) node->src[1]->ne[1], (long long) node->src[1]->ne[2]);
+            }
+            use_cuda_graph = false;
+            break;
+        }
 
         if (ggml_cuda_is_view_or_noop(node)) {
             continue;

@@ -1173,6 +1173,26 @@ private:
 
     bool tu_engaged = false; // on, the context can run jobs, and more than one slot
 
+    // [TAG_CKPT_DEV] LLAMA_CKPT_DEV=1: a device copy of the target state of the last checkpoint restored from the host (the state's
+    // host header in blob, its tensors in the context's device storage of the sequence that saved it), keyed by its token prefix
+    struct {
+        bool                 on  = false;
+        uint64_t             key = 0;
+        std::vector<uint8_t> blob;
+        explicit operator bool() const { return on; }
+    } ckpt_dev;
+    // the key of the first n tokens of a slot's prompt (0: none)
+    static uint64_t ckpt_dev_key(const server_tokens & tokens, int64_t n) {
+        if (n <= 0 || (size_t) n > tokens.size()) {
+            return 0;
+        }
+        uint64_t h = 1469598103934665603ULL ^ (uint64_t) n;
+        for (int64_t i = 0; i < n; ++i) {
+            h = (h ^ (uint64_t) (uint32_t) tokens[i]) * 1099511628211ULL;
+        }
+        return h == 0 ? 1 : h;
+    }
+
     // live controls (POST /props): the policy can engage on this server (LLAMA_TU at load, the context can run jobs,
     // more than one slot, no multimodal), and is engaged while it is also enabled
     bool    tu_capable   = false;
@@ -1795,6 +1815,7 @@ private:
                 tu_policy.fair_read    = env_int("LLAMA_TU_FAIR_READ", 1) != 0;
                 tu_seeded = true;
             }
+            ckpt_dev.on = env_int("LLAMA_CKPT_DEV", 0) != 0;
 
             const bool can_run = llama_decode_job_supported(ctx_tgt);
             tu_capable = can_run && params_base.n_parallel > 1 && mctx == nullptr;
@@ -5531,11 +5552,38 @@ private:
                                     bool do_reset = it == slot.prompt.checkpoints.rend();
 
                                     if (!do_reset) {
-                                        // restore the context checkpoint
-                                        it->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                                        // restore the context checkpoint (LLAMA_CKPT_TIMERS=1: its host time)
+                                        static const bool ckpt_timers = getenv("LLAMA_CKPT_TIMERS") != nullptr;
+                                        // [TAG_CKPT_DEV] the checkpoint this slot restored last comes back from its device copy: a 150 MiB
+                                        // state over the host link took 48.5 ms of each warm prompt (a new conversation on a shared
+                                        // system prompt). A restore from the host leaves a device copy of what it restored
+                                                                        const llama_state_seq_flags fl_dev = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE;
+                                        const int64_t t_r0 = ggml_time_us();
+                                        bool from_dev = false;
+                                        // one copy for the server, keyed by the checkpoint's token prefix, so either slot restores it: the slot's cache
+                                        // holds those tokens (its common prefix with the prompt covers the checkpoint), and only the recurrent
+                                        // state is restored (PARTIAL_ONLY), which those tokens determine
+                                        const uint64_t key = ckpt_dev ? ckpt_dev_key(slot.prompt.tokens, it->n_tokens) : 0;
+                                        if (ckpt_dev && key != 0 && key == ckpt_dev.key && !ckpt_dev.blob.empty()) {
+                                            from_dev = llama_state_seq_set_data_ext(ctx_tgt, ckpt_dev.blob.data(), ckpt_dev.blob.size(), slot.id, fl_dev) ==
+                                                ckpt_dev.blob.size();
+                                        }
+                                        if (!from_dev) {
+                                            it->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                                            if (ckpt_dev && key != 0) {
+                                                const size_t sz = llama_state_seq_get_size_ext(ctx_tgt, slot.id, fl_dev);
+                                                ckpt_dev.blob.resize(sz);
+                                                ckpt_dev.key = llama_state_seq_get_data_ext(ctx_tgt, ckpt_dev.blob.data(), sz, slot.id, fl_dev) == sz ? key : 0;
+                                            }
+                                        }
+                                        const int64_t t_r1 = ggml_time_us();
                                         it->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                                         // restore the draft's speculative state
                                         common_speculative_set_state(spec.get(), slot.id, it->data_spec);
+                                        if (ckpt_timers) {
+                                            LOG_WRN("ckpt-restore: tgt %.1f ms (%zu B, %s) dft+spec %.1f ms at n_tokens %" PRId64 "\n", (t_r1 - t_r0)/1000.0,
+                                                    it->data_tgt.size(), from_dev ? "device copy" : "host", (ggml_time_us() - t_r1)/1000.0, it->n_tokens);
+                                        }
 
                                         pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
                                         n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
