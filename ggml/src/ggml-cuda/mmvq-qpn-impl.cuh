@@ -2017,6 +2017,12 @@ static inline bool ggml_cuda_qpn_full_on() {
 // hold the next one, so a consumer's ring is still two deep.
 // One producer a consumer: with a producer serving two consumers in turn, its next loads waited until both had freed their slot,
 // so each round exposed DRAM's latency (ncu, staged at 4 tokens: 17% of stall samples were consumers polling their fill count)
+// Tried and dropped: half-superblock slots (half 0 = code chunks 0-3, high bits 8-9, scales and tail; half 1 = the rest; a ring of
+// 1-3 halves beside two in the producer's registers). Q6_K ffn down at 4 tokens: 125.9 / 117.9 / 119.4 us at 1 / 2 / 3 halves,
+// against 105.4 for these whole slots, and the head 1609 against 1530: depth did not help, and the hand-off inside the superblock
+// (a fence and a wait at unit 4) cost the consumer more than it saved. The gap between consumers alone (69 us) or the producers'
+// reads alone (~850-900 GB/s) and the two together (105 us) is the SM's shared load/store, L1 and shared-memory throughput
+// (sfdev/qpn-ring-halfslot.patch).
 #define QPN_RING_S  4
 #define QPN_RING_R  2
 #define QPN_RING_NP 8
