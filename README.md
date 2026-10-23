@@ -40,7 +40,7 @@ fork runs the [Run](#run) line below.
 | Context | 2 concurrent slots of 65,536 each | 2 concurrent slots sharing one 245,760-token pool (`--kv-unified`) |
 
 Decode on the first two prompts is 3–4% slower, the cost of reading an 8-bit cache, in exchange for 1.9× the context;
-the third prompt's rate moves with the draft's acceptance at temperature 1.0.
+the third prompt's rate moves with how many draft tokens it accepts (the probe decodes greedily).
 
 Upstream's two-user scheduler refuses DFlash2 prompt jobs, so there a side request's prompt waits until the other slot
 finishes generating. Here it starts at once and the generating slot keeps ~34 tok/s while it is read (section 8).
