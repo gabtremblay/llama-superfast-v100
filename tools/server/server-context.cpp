@@ -298,6 +298,10 @@ struct server_slot {
     int32_t n_keep  = 0;
     int32_t i_batch = -1;
 
+    // [TAG_CKPT_TAIL_SNAP] the last tokens of the prompt in this batch whose checkpoint (that many tokens before its end) is
+    // written after the decode from the recurrent rollback snapshot (0: none)
+    int32_t ckpt_tail = 0;
+
     // the slot's prompt batch is the two-user scheduling job's (filled into its batch, until the job ends); its
     // cache sequence and its outputs belong to the job meanwhile
     bool tu_owned = false;
@@ -1173,14 +1177,82 @@ private:
 
     bool tu_engaged = false; // on, the context can run jobs, and more than one slot
 
-    // [TAG_CKPT_DEV] LLAMA_CKPT_DEV=1: a device copy of the target state of the last checkpoint restored from the host (the state's
-    // host header in blob, its tensors in the context's device storage of the sequence that saved it), keyed by its token prefix
-    struct {
-        bool                 on  = false;
-        uint64_t             key = 0;
+    // [TAG_CKPT_DEV] LLAMA_CKPT_DEV=N (default 2; 0: off): device copies of the target state of N checkpoints, the least recently
+    // used replaced, each keyed by its token prefix (the state's host header in blob, its tensors in the context's device storage
+    // CKPT_DEV_STORAGE + its index). Filled by a restore from the host and by the checkpoint before a prompt's end (the next
+    // turn of that conversation restores it); a restore of a prefix held here, from either slot, reads it on the device
+    static constexpr int32_t CKPT_DEV_STORAGE = 1000;
+    struct ckpt_dev_entry {
+        uint64_t             key  = 0;
+        uint64_t             used = 0;
+        int32_t              tail = -1; // the slot whose last checkpoint before a prompt's end this is (-1: a restored one)
         std::vector<uint8_t> blob;
-        explicit operator bool() const { return on; }
+    };
+    struct {
+        int32_t                     n    = 0;
+        uint64_t                    tick = 0;
+        std::vector<ckpt_dev_entry> e;
+        explicit operator bool() const { return n > 0; }
     } ckpt_dev;
+
+    // the entry holding key (-1: none)
+    int32_t ckpt_dev_find(uint64_t key) {
+        for (size_t i = 0; key != 0 && i < ckpt_dev.e.size(); ++i) {
+            if (ckpt_dev.e[i].key == key && !ckpt_dev.e[i].blob.empty()) {
+                ckpt_dev.e[i].used = ++ckpt_dev.tick;
+                return (int32_t) i;
+            }
+        }
+        return -1;
+    }
+    // restores the target state of slot from the device copy of key; false if there is none (nothing changed)
+    bool ckpt_dev_restore(server_slot & slot, uint64_t key) {
+        const int32_t i = ckpt_dev ? ckpt_dev_find(key) : -1;
+        if (i < 0) {
+            return false;
+        }
+        auto & en = ckpt_dev.e[i];
+        llama_state_seq_set_device_key(ctx_tgt, CKPT_DEV_STORAGE + i);
+        const bool ok = llama_state_seq_set_data_ext(ctx_tgt, en.blob.data(), en.blob.size(), slot.id,
+                LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) == en.blob.size();
+        llama_state_seq_set_device_key(ctx_tgt, -1);
+        return ok;
+    }
+    // a device copy of slot's target state (as its state writes read it now) under key, unless one is held. A slot's checkpoint
+    // before a prompt's end (tail) replaces that slot's previous one, so a conversation's next-turn copy does not push out a
+    // restored prefix (a shared system prompt); otherwise the least recently used entry goes
+    void ckpt_dev_store(server_slot & slot, uint64_t key, bool tail) {
+        if (!ckpt_dev || key == 0 || ckpt_dev_find(key) >= 0) {
+            return;
+        }
+        int32_t i = -1;
+        for (int32_t k = 0; tail && k < (int32_t) ckpt_dev.e.size(); ++k) {
+            if (ckpt_dev.e[k].tail == slot.id) {
+                i = k;
+            }
+        }
+        if (i < 0 && (int32_t) ckpt_dev.e.size() < ckpt_dev.n) {
+            ckpt_dev.e.emplace_back();
+            i = (int32_t) ckpt_dev.e.size() - 1;
+        }
+        if (i < 0) {
+            i = 0;
+            for (int32_t k = 1; k < (int32_t) ckpt_dev.e.size(); ++k) {
+                if (ckpt_dev.e[k].used < ckpt_dev.e[i].used) {
+                    i = k;
+                }
+            }
+        }
+        auto & en = ckpt_dev.e[i];
+        en.tail = tail ? slot.id : -1;
+        const llama_state_seq_flags fl = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE;
+        llama_state_seq_set_device_key(ctx_tgt, CKPT_DEV_STORAGE + i);
+        const size_t sz = llama_state_seq_get_size_ext(ctx_tgt, slot.id, fl);
+        en.blob.resize(sz);
+        en.key  = llama_state_seq_get_data_ext(ctx_tgt, en.blob.data(), sz, slot.id, fl) == sz ? key : 0;
+        en.used = ++ckpt_dev.tick;
+        llama_state_seq_set_device_key(ctx_tgt, -1);
+    }
     // the key of the first n tokens of a slot's prompt (0: none)
     static uint64_t ckpt_dev_key(const server_tokens & tokens, int64_t n) {
         if (n <= 0 || (size_t) n > tokens.size()) {
@@ -1815,7 +1887,7 @@ private:
                 tu_policy.fair_read    = env_int("LLAMA_TU_FAIR_READ", 1) != 0;
                 tu_seeded = true;
             }
-            ckpt_dev.on = env_int("LLAMA_CKPT_DEV", 0) != 0;
+            ckpt_dev.n = std::max(0, env_int("LLAMA_CKPT_DEV", 2));
 
             const bool can_run = llama_decode_job_supported(ctx_tgt);
             tu_capable = can_run && params_base.n_parallel > 1 && mctx == nullptr;
@@ -4445,6 +4517,36 @@ private:
                 abort_all_slots("post_decode() failed: " + std::string(e.what()));
                 break; // stop any further processing
             }
+
+            ckpt_tail_create();
+        }
+    }
+
+    // [TAG_CKPT_TAIL_SNAP] the checkpoint a few tokens before a prompt's end, from the recurrent rollback snapshot of the decode
+    // that read them (the attention cache is positional, and the draft's cells past it are removed when it is restored). After
+    // post_decode, so the first token is out first: no decode has run since, so the state and its snapshots are still the decode's
+    void ckpt_tail_create() {
+        for (auto & slot : slots) {
+            if (slot.ckpt_tail <= 0) {
+                continue;
+            }
+            const int32_t n_back = slot.ckpt_tail;
+            slot.ckpt_tail = 0;
+            if (slot.task == nullptr || slot.prompt.n_tokens() < slot.task->n_tokens()) {
+                continue;
+            }
+            auto * mem = llama_get_memory(ctx_tgt);
+            if (llama_memory_rs_view_back(mem, slot.id, n_back)) {
+                const llama_pos pos_min = llama_memory_seq_pos_min(mem, slot.id);
+                const llama_pos pos_max = llama_memory_seq_pos_max(mem, slot.id);
+                // the checkpoint is at the prompt's end less n_back (whatever the slot's tokens hold past the prompt by now)
+                create_checkpoint(slot, slot.prompt.n_tokens() - (slot.task->n_tokens() - n_back), pos_min, pos_max);
+                // the next turn of this conversation restores this checkpoint
+                ckpt_dev_store(slot, ckpt_dev_key(slot.prompt.tokens, slot.task->n_tokens() - n_back), true);
+                llama_memory_rs_view_end(mem, slot.id);
+            } else {
+                SLT_WRN(slot, "no rollback snapshot %d tokens before the prompt's end: no checkpoint there\n", n_back);
+            }
         }
     }
 
@@ -5557,24 +5659,16 @@ private:
                                         // [TAG_CKPT_DEV] the checkpoint this slot restored last comes back from its device copy: a 150 MiB
                                         // state over the host link took 48.5 ms of each warm prompt (a new conversation on a shared
                                         // system prompt). A restore from the host leaves a device copy of what it restored
-                                                                        const llama_state_seq_flags fl_dev = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE;
-                                        const int64_t t_r0 = ggml_time_us();
+                                                                        const int64_t t_r0 = ggml_time_us();
                                         bool from_dev = false;
                                         // one copy for the server, keyed by the checkpoint's token prefix, so either slot restores it: the slot's cache
                                         // holds those tokens (its common prefix with the prompt covers the checkpoint), and only the recurrent
                                         // state is restored (PARTIAL_ONLY), which those tokens determine
                                         const uint64_t key = ckpt_dev ? ckpt_dev_key(slot.prompt.tokens, it->n_tokens) : 0;
-                                        if (ckpt_dev && key != 0 && key == ckpt_dev.key && !ckpt_dev.blob.empty()) {
-                                            from_dev = llama_state_seq_set_data_ext(ctx_tgt, ckpt_dev.blob.data(), ckpt_dev.blob.size(), slot.id, fl_dev) ==
-                                                ckpt_dev.blob.size();
-                                        }
+                                        from_dev = ckpt_dev_restore(slot, key);
                                         if (!from_dev) {
                                             it->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-                                            if (ckpt_dev && key != 0) {
-                                                const size_t sz = llama_state_seq_get_size_ext(ctx_tgt, slot.id, fl_dev);
-                                                ckpt_dev.blob.resize(sz);
-                                                ckpt_dev.key = llama_state_seq_get_data_ext(ctx_tgt, ckpt_dev.blob.data(), sz, slot.id, fl_dev) == sz ? key : 0;
-                                            }
+                                            ckpt_dev_store(slot, key, false);
                                         }
                                         const int64_t t_r1 = ggml_time_us();
                                         it->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
@@ -5828,10 +5922,21 @@ private:
                         if (do_checkpoint) {
                             static const int checkpoint_offsets[] = {4 + n_ubatch, 4};
 
+                            // [TAG_CKPT_TAIL_SNAP] LLAMA_CKPT_TAIL_SNAP (default 1): the last 4 tokens stay in a batch that holds
+                            // tokens of this slot before them, and the checkpoint 4 tokens before the end is written after the
+                            // decode from the recurrent state's rollback snapshot (llama_memory_rs_view_back, create_checkpoint
+                            // in decode()): their own decode, a full pass over the weights, its draft injection and the wait
+                            // before it cost a ~180-token chat turn ~50 ms of its first token. Not for a prompt job's batch
+                            static const bool tail_snap = [] { const char * e = getenv("LLAMA_CKPT_TAIL_SNAP"); return e == nullptr || atoi(e) != 0; }();
                             bool should_break = false;
                             for (int offset : checkpoint_offsets) {
                                 const int n_last = std::min(n_batch, offset);
                                 if (slot.task->n_tokens() == slot.prompt.n_tokens() + n_last) {
+                                    if (offset == 4 && tail_snap && !to_job && !has_mtmd && pb.size() > n_tokens_prev &&
+                                            llama_n_rs_seq(ctx_tgt) >= 4) {
+                                        slot.ckpt_tail = 4;
+                                        break;
+                                    }
                                     should_break = true;
                                     break;
                                 }

@@ -437,6 +437,40 @@ llama_pos llama_memory_recurrent::seq_pos_max(llama_seq_id seq_id) const {
     return result;
 }
 
+bool llama_memory_recurrent::rs_view_back(llama_seq_id seq_id, int32_t n_back) {
+    if (n_rs_seq == 0 || n_back < 1 || (uint32_t) n_back > n_rs_seq || seq_id < 0 || (uint32_t) seq_id >= n_seq_max ||
+            (uint32_t) seq_id >= size || rs_idx[seq_id] != 0) {
+        return false;
+    }
+    const int32_t tail_id = cells[seq_id].tail;
+    if (tail_id < 0) {
+        return false;
+    }
+    auto & cell = cells[tail_id];
+    if (cell.n_last <= (uint32_t) n_back || cell.pos < n_back) {
+        return false;
+    }
+    if (rs_view_pos.size() < n_seq_max) {
+        rs_view_pos.resize(n_seq_max, -1);
+    }
+    rs_view_pos[seq_id] = cell.pos;
+    cell.pos -= n_back;
+    rs_idx[seq_id] = (uint32_t) n_back;
+    return true;
+}
+
+void llama_memory_recurrent::rs_view_end(llama_seq_id seq_id) {
+    if (seq_id < 0 || (size_t) seq_id >= rs_view_pos.size() || rs_view_pos[seq_id] < 0) {
+        return;
+    }
+    const int32_t tail_id = cells[seq_id].tail;
+    if (tail_id >= 0) {
+        cells[tail_id].pos = rs_view_pos[seq_id];
+    }
+    rs_idx[seq_id]      = 0;
+    rs_view_pos[seq_id] = -1;
+}
+
 void llama_memory_recurrent::set_rs_idx(llama_seq_id seq_id, uint32_t idx) {
     if (seq_id < 0) {
         std::fill(rs_idx.begin(), rs_idx.end(), 0);

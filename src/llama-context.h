@@ -663,6 +663,8 @@ private:
 public:
     // the MTP draft's chained steps (llama_mtp_chain_set): the next decode's request and the last one's picks
     llm_graph_mtp_chain_state mtp_chain;
+    // [TAG_CKPT_DEV] the mem_storage entry of the next LLAMA_STATE_SEQ_FLAGS_ON_DEVICE gets and sets (-1: the sequence's own)
+    int32_t state_dev_key = -1;
 private:
 
     // the meta arenas (ggml_backend_meta_set_arena, --split-mode tensor) of this context's two schedulers: an MTP

@@ -4859,7 +4859,7 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
 
     std::unique_ptr<llama_io_write_i> io;
     if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
-        io = std::make_unique<llama_io_write_device>(dst, size, mem_storage[seq_id]);
+        io = std::make_unique<llama_io_write_device>(dst, size, mem_storage[state_dev_key >= 0 ? state_dev_key : seq_id]);
     } else {
         io = std::make_unique<llama_io_write_host>(dst, size);
     }
@@ -4995,9 +4995,10 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
         llama_seq_id seq_id_read;
         io->read(&seq_id_read, sizeof(seq_id_read));
 
-        GGML_ASSERT(mem_storage.find(seq_id_read) != mem_storage.end());
+        const llama_seq_id key = state_dev_key >= 0 ? state_dev_key : seq_id_read;
+        GGML_ASSERT(mem_storage.find(key) != mem_storage.end());
 
-        io = std::make_unique<llama_io_read_device>(src, size, mem_storage[seq_id_read]);
+        io = std::make_unique<llama_io_read_device>(src, size, mem_storage[key]);
     } else {
         io = std::make_unique<llama_io_read_host>(src, size);
     }
@@ -6151,6 +6152,28 @@ llama_pos llama_memory_seq_pos_max(
     }
 
     return mem->seq_pos_max(seq_id);
+}
+
+static llama_memory_recurrent * llama_memory_get_recr(llama_memory_t mem) {
+    if (auto * h = dynamic_cast<llama_memory_hybrid *>(mem)) {
+        return h->get_mem_recr();
+    }
+    return dynamic_cast<llama_memory_recurrent *>(mem);
+}
+
+void llama_state_seq_set_device_key(llama_context * ctx, int32_t key) {
+    ctx->state_dev_key = key;
+}
+
+bool llama_memory_rs_view_back(llama_memory_t mem, llama_seq_id seq_id, int32_t n_back) {
+    auto * r = mem ? llama_memory_get_recr(mem) : nullptr;
+    return r != nullptr && r->rs_view_back(seq_id, n_back);
+}
+
+void llama_memory_rs_view_end(llama_memory_t mem, llama_seq_id seq_id) {
+    if (auto * r = mem ? llama_memory_get_recr(mem) : nullptr) {
+        r->rs_view_end(seq_id);
+    }
 }
 
 bool llama_memory_can_shift(llama_memory_t mem) {

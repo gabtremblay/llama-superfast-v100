@@ -86,6 +86,13 @@ public:
 
     void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
 
+    // [TAG_CKPT_TAIL_SNAP] until rs_view_end, the state writes of seq_id read its state n_back tokens back: a rollback snapshot of
+    // the last ubatch (and the position its metadata says), the live state unchanged. False when there is none: no snapshots, a
+    // rollback pending, or a last ubatch of at most n_back tokens of the sequence
+    bool rs_view_back(llama_seq_id seq_id, int32_t n_back);
+    void rs_view_end (llama_seq_id seq_id);
+    std::vector<llama_pos> rs_view_pos; // the live positions under a view (-1: none)
+
     // [TAG_SPEC_PIPELINE] a second group of (1 + n_rs_seq) snapshot rows per cell (0 when off, LLAMA_SPEC_PIPELINE),
     // holding a copy of the previous decode's snapshots: a pipelined decode overwrites them while the decode before
     // it is not yet verified, and seq_rm can then roll back into that decode from the copy

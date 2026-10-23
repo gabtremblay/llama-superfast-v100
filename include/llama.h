@@ -815,6 +815,15 @@ extern "C" {
                  llama_pos p0,
                  llama_pos p1);
 
+    // [TAG_CKPT_TAIL_SNAP] the recurrent part's state writes of seq_id (llama_state_seq_get_*) read its state n_back tokens back, a
+    // rollback snapshot of the last decode, until llama_memory_rs_view_end; the attention cache and the live state are unchanged.
+    // Returns false when the memory has no such snapshot (then nothing changes)
+    LLAMA_API bool llama_memory_rs_view_back(llama_memory_t mem, llama_seq_id seq_id, int32_t n_back);
+    // [TAG_CKPT_DEV] the device storage that LLAMA_STATE_SEQ_FLAGS_ON_DEVICE state gets and sets use from now on: key >= 0 names
+    // a storage of its own (so several device copies can be kept), -1 the sequence's (the default)
+    LLAMA_API void llama_state_seq_set_device_key(struct llama_context * ctx, int32_t key);
+    LLAMA_API void llama_memory_rs_view_end (llama_memory_t mem, llama_seq_id seq_id);
+
     // Copy all tokens that belong to the specified sequence to another sequence
     // p0 < 0 : [0,  p1]
     // p1 < 0 : [p0, inf)
