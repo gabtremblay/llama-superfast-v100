@@ -3182,6 +3182,8 @@ int32_t llama_context::job_step(int32_t n_groups) {
         J.t_host_us += ggml_time_us() - t0;
 
         const int32_t il0 = J.il_next;
+        // [TAG_TU_IDLE_SLICE] the group's layers as set now (llama_decode_job_set_layers between steps), not only at job_begin
+        J.layers = tu_layers;
         const int32_t il1 = std::min(n_layer, il0 + J.layers);
 
         ggml_status status = GGML_STATUS_FAILED;

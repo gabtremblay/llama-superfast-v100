@@ -1294,6 +1294,7 @@ private:
         int32_t n_rounds_pending = 0; // decode rounds since the job's last group
         int32_t n_joint_pending  = 0; // of them, rounds of more than one slot
         int32_t peer_rounds      = 0; // decode rounds between the job's consecutive groups
+        int32_t layers           = 4; // the job's layers per group (TAG_TU_GROUP_ROWS); idle slices take more (TAG_TU_IDLE_SLICE)
         int32_t joint_rounds     = 0;
         bool    overshoot_logged = false;
 
@@ -4628,6 +4629,7 @@ private:
         // shorter job, so its slices still fill the budget instead of paying a graph build and a sync per few layers
         // (LLAMA_TU_GROUP_ROWS=0: tu_policy.group for every job)
         static const bool group_rows = [] { const char * e = getenv("LLAMA_TU_GROUP_ROWS"); return e == nullptr || atoi(e) != 0; }();
+        int32_t job_layers = tu_policy.group;
         {
             const int32_t n_rows = std::max<int32_t>(1, batch_tu.size());
             const int32_t n_ub   = (int32_t) llama_n_ubatch(ctx_tgt);
@@ -4635,12 +4637,14 @@ private:
             const int32_t layers = group_rows ? (int32_t) std::min<int64_t>(n_lay, (int64_t) tu_policy.group*std::max<int32_t>(1, n_ub/n_rows))
                                               : tu_policy.group;
             llama_decode_job_set_layers(ctx_tgt, layers);
+            job_layers = llama_decode_job_get_layers(ctx_tgt);
         }
 
         metrics_pre_decode();
 
         tu_job = {};
-        tu_job.slot = slot;
+        tu_job.slot   = slot;
+        tu_job.layers = job_layers;
 
         const int64_t t0 = ggml_time_us();
         int32_t ret = 0;
@@ -4895,7 +4899,12 @@ private:
                 other_reader = true;
             }
         }
-        const double budget = peer || other_reader ? (double) tu_policy.slice_ms : std::max<double>(tu_policy.slice_ms, idle_slice_ms);
+        const bool   idle   = !peer && !other_reader;
+        const double budget = idle ? std::max<double>(tu_policy.slice_ms, idle_slice_ms) : (double) tu_policy.slice_ms;
+        // ... and its groups take LLAMA_TU_IDLE_GROUP layers (default 16): each group is a graph of its own, built and allocated
+        // for every group of every ubatch (16 of them at 4 layers, ~4% of a long prompt's read: 48k tokens 838 -> 803 tok/s)
+        static const int32_t idle_group = [] { const char * e = getenv("LLAMA_TU_IDLE_GROUP"); return e ? std::max(1, atoi(e)) : 16; }();
+        llama_decode_job_set_layers(ctx_tgt, idle ? std::max(tu_job.layers, std::min(idle_group, llama_model_n_layer(model_tgt))) : tu_job.layers);
 
         double  t_slice      = 0.0;
         int     n_run        = 0; // steps in this slice
