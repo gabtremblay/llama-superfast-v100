@@ -5,9 +5,11 @@ tuned for the Tesla V100 (Volta, `sm_70`), created for **one V100 card**, a **si
 **unified KV cache**, to make agentic work palatable while maximizing context size. It adds:
 
 - an 8-bit (`q8_0`) KV cache on upstream's fast Volta attention kernels, which with the memory changes below nearly
-  doubles the context one 32 GB card holds, for 2–3% of decode speed;
+  doubles the context one 32 GB card holds, for a few percent of decode speed;
 - a unified KV cache (`--kv-unified`) that runs at the split cache's speed, so two slots share one 245,760-token pool;
-- faster prefill on upstream's repacked weights;
+- upstream's two-user scheduler working with the DFlash2 draft on that unified cache, so a side request's prompt is read
+  while the other slot keeps generating instead of waiting for it to finish;
+- faster prefill on upstream's repacked weights, and a faster first token on short prompts;
 - prompt work (DFlash2 features, checkpoints, masks) that stays on the GPU instead of crossing the host link;
 - a smaller CUDA graph cache, which freed ~1.2 GB of VRAM that only grew under real traffic.
 
@@ -16,30 +18,34 @@ main thinking thread, and the side requests an agent harness sends in parallel w
 eGPU link (~3.3 GB/s), so anything that crosses the host link is on the critical path; the gains from keeping work on
 the GPU are largest on a link like that.
 
-Everything upstream (the tensor-core matvec on repacked K-quants, MTP, the two-user scheduler, two-card tensor
-parallel) is unchanged and documented further down, from [Upstream: llama-superfast-v100](#upstream-llama-superfast-v100).
+The rest of upstream (the tensor-core matvec on repacked K-quants, MTP, the two-user scheduler's design, two-card
+tensor parallel) is documented further down, from [Upstream: llama-superfast-v100](#upstream-llama-superfast-v100).
 
 Part of this work was sponsored by [Inscora](https://inscora.com). If you are an MSP or MSSP and want to offer cyber
 insurance services to your clients, have a look at [inscora.com](https://inscora.com).
 
 ## Results
 
-One V100 PCIe 32 GB, Qwen3.8-27B `UD-Q4_K_XL`, DFlash2 draft, two slots, `--cache-ram 0`, measured in one session.
+One V100 PCIe 32 GB, Qwen3.8-27B `UD-Q4_K_XL`, DFlash2 draft, two slots, `--cache-ram 0`, the same probes for both.
 Upstream is [bitexploder/llama-superfast-v100](https://github.com/bitexploder/llama-superfast-v100) at `403f06f` with its
 f16 KV cache and its recipe (`-b 4096 -ub 2048`), at the largest two-slot context it fits with the DFlash2 draft. This
 fork runs the [Run](#run) line below.
 
 | | Upstream, f16 KV | This fork, `q8_0` KV |
 |---|---|---|
-| Cold prefill, ~8k-token prompt | 880 tok/s | 980 tok/s |
-| Cold prefill, ~48k-token prompt | 797 tok/s | 837 tok/s |
-| Time to first token, new ~125-token chat turn (median) | 657 ms | 429 ms |
-| Decode, 400 tokens, three prompts | 95 / 93 / 99 tok/s | 92 / 91 / 97 tok/s |
+| Cold prefill, ~8k-token prompt | 880 tok/s | 975 tok/s |
+| Cold prefill, ~48k-token prompt | 797 tok/s | 831 tok/s |
+| Time to first token, new ~125-token chat turn (median) | 657 ms | 260 ms |
+| Decode, 400 tokens, three prompts | 95 / 93 / 99 tok/s | 91 / 90 / 115 tok/s |
 | Context | 2 concurrent slots of 65,536 each | 2 concurrent slots sharing one 245,760-token pool (`--kv-unified`) |
 
-Decode is 2–3% slower, the cost of reading an 8-bit cache, in exchange for 1.9× the context.
+Decode on the first two prompts is 3–4% slower, the cost of reading an 8-bit cache, in exchange for 1.9× the context;
+the third prompt's rate moves with the draft's acceptance at temperature 1.0.
 
-The 245,760-token pool peaks at 31,980 MiB of the card's 32,494 over a long run of mixed agentic traffic.
+Upstream's two-user scheduler refuses DFlash2 prompt jobs, so there a side request's prompt waits until the other slot
+finishes generating. Here it starts at once and the generating slot keeps ~34 tok/s while it is read (section 8).
+
+The 245,760-token pool peaks at 32,128 MiB of the card's 32,494 over a long run of mixed agentic traffic.
 
 ## Build
 
@@ -92,18 +98,19 @@ repository.
 One card, two slots, DFlash2, one 245,760-token pool:
 
 ```bash
-LLAMA_TU=0 LLAMA_DFLASH2_HEAD_FILE=models/mtp-Qwen3.8-27B-Q4_0.gguf LLAMA_SPEC_DRAFT_VOCAB_FILE=models/draft-vocab-qwen3.8-27b.txt build/bin/llama-server -m models/Qwen3.8-27B-UD-Q4_K_XL.gguf -md models/Qwen3.8-27B-DFlash2-Q4_K_M.gguf --spec-type draft-dflash --spec-draft-n-max 7 --spec-draft-ubatch 512 -c 245760 --parallel 2 --kv-unified -fa on -ngl 99 -ctk q8_0 -ctv q8_0 -ctkd f16 -ctvd f16 -t 12 -b 2048 -ub 2048 --cache-ram 0 --jinja --metrics --temp 1.0 --top-p 0.95 --top-k 20 --host 127.0.0.1 --port 8080
+LLAMA_DFLASH2_HEAD_FILE=models/mtp-Qwen3.8-27B-Q4_0.gguf LLAMA_SPEC_DRAFT_VOCAB_FILE=models/draft-vocab-qwen3.8-27b.txt build/bin/llama-server -m models/Qwen3.8-27B-UD-Q4_K_XL.gguf -md models/Qwen3.8-27B-DFlash2-Q4_K_M.gguf --spec-type draft-dflash --spec-draft-n-max 7 --spec-draft-ubatch 512 -c 245760 --parallel 2 --kv-unified -fa on -ngl 99 -ctk q8_0 -ctv q8_0 -ctkd f16 -ctvd f16 -t 12 -b 2048 -ub 2048 --cache-ram 0 --jinja --metrics --temp 1.0 --top-p 0.95 --top-k 20 --host 127.0.0.1 --port 8080
 ```
 
 The same with the Docker image (models in `$PWD/models`):
 
 ```bash
-docker run -d --name llama-superfast --init --gpus all -p 8080:8080 -v "$PWD/models:/models:ro" -e LLAMA_TU=0 -e LLAMA_DFLASH2_HEAD_FILE=/models/mtp-Qwen3.8-27B-Q4_0.gguf llama-superfast-v100 --host 0.0.0.0 --port 8080 -m /models/Qwen3.8-27B-UD-Q4_K_XL.gguf -md /models/Qwen3.8-27B-DFlash2-Q4_K_M.gguf --spec-type draft-dflash --spec-draft-n-max 7 --spec-draft-ubatch 512 -c 245760 --parallel 2 --kv-unified -fa on -ngl 99 -ctk q8_0 -ctv q8_0 -ctkd f16 -ctvd f16 -t 12 -b 2048 -ub 2048 --cache-ram 0 --jinja --metrics --temp 1.0 --top-p 0.95 --top-k 20
+docker run -d --name llama-superfast --init --gpus all -p 8080:8080 -v "$PWD/models:/models:ro" -e LLAMA_DFLASH2_HEAD_FILE=/models/mtp-Qwen3.8-27B-Q4_0.gguf llama-superfast-v100 --host 0.0.0.0 --port 8080 -m /models/Qwen3.8-27B-UD-Q4_K_XL.gguf -md /models/Qwen3.8-27B-DFlash2-Q4_K_M.gguf --spec-type draft-dflash --spec-draft-n-max 7 --spec-draft-ubatch 512 -c 245760 --parallel 2 --kv-unified -fa on -ngl 99 -ctk q8_0 -ctv q8_0 -ctkd f16 -ctvd f16 -t 12 -b 2048 -ub 2048 --cache-ram 0 --jinja --metrics --temp 1.0 --top-p 0.95 --top-k 20
 ```
 
 What the settings do:
 
-- `LLAMA_TU=0` is required with DFlash2: the two-user scheduler rejects its long prompts.
+- The two-user scheduler is on (section 8): a long prompt in one slot no longer stalls the other slot's decode.
+  `LLAMA_TU=0` turns it off.
 - `LLAMA_DFLASH2_HEAD_FILE` points DFlash2's output head at the MTP file's rows.
 - `LLAMA_SPEC_DRAFT_VOCAB_FILE` (set by the Docker image) restricts the draft to the top 98,304 ids of the file's
   131,072-id ranking. Without it, decode is ~5–10% slower.
@@ -115,15 +122,14 @@ What the settings do:
 - `--cache-ram 0` turns off the host prompt cache. Saving a slot's state to host memory costs ~220 ms over a slow link
   each time a slot switches conversations; with one user and pinned slots (`id_slot` in the request) the cache brings
   little. On a fast link, try it on.
-- 245,760 tokens peaks at ~31.9 GB. VRAM keeps growing for the first minutes of real traffic, so size a different
+- 245,760 tokens peaks at ~32.1 GB. VRAM keeps growing for the first minutes of real traffic, so size a different
   context from a long mixed run, not a fill test (section 5).
 
-Check the startup log for `two-user scheduling (LLAMA_TU): off`, the draft model loading, and
+Check the startup log for `two-user scheduling (LLAMA_TU): on`, the draft model loading, and
 `n_slots = 2, n_ctx_slot = 245760`. Draft acceptance on this target is ~0.5; near zero means the draft did not load.
 
 For MTP instead of DFlash2: `-md models/mtp-Qwen3.8-27B-Q4_0.gguf --spec-type draft-mtp`, without
-`LLAMA_DFLASH2_HEAD_FILE`, `LLAMA_TU=0` or `--spec-draft-ubatch`. It decodes slower here but leaves the two-user
-scheduler on.
+`LLAMA_DFLASH2_HEAD_FILE` or `--spec-draft-ubatch`. It decodes slower here.
 
 ## What changed
 
@@ -224,12 +230,56 @@ and set the length of every build. Its kernels now live in `mmvq-qpn-impl.cuh`, 
 instantiated in its own file under `ggml/src/ggml-cuda/template-instances/` (`generate_qpn_cu_files.py`), like upstream
 llama.cpp's MMQ. The longest of those files takes ~90 s. Every kernel's PTX is unchanged.
 
+### 8. The two-user scheduler with DFlash2 on a unified cache
+
+The two-user scheduler reads a long prompt as a job of layer groups interleaved with the other slot's decode. It refused
+every DFlash2 job (the draft needs the target's layer inputs) and did not run on a unified cache, so with DFlash2 a side
+request's prompt waited until the other slot finished generating, or (`LLAMA_TU_FIX=0`) the generating slot fell to
+~3 tok/s while the prompt was read.
+
+- A job's groups copy each draft layer's input into a persistent f32 buffer (~210 MiB at `-b 2048`), which becomes the
+  device feature path's source when the job publishes. Greedy outputs and draft acceptance are identical with the
+  scheduler on and off.
+- On a unified cache jobs are one ubatch (`-b <= -ub`), and the job's cell hash covers only its own sequence.
+- With a slot generating, a read of at most 256 rows joins the decode round (`LLAMA_TU_GEN_JOB_MIN`), a longer one runs
+  as jobs of at most 1,024 rows (`LLAMA_TU_GEN_JOB_ROWS`), and a shorter job's groups take more layers. Idle, a job's
+  slices and groups are longer (`LLAMA_TU_IDLE_SLICE_MS`, `LLAMA_TU_IDLE_GROUP`), so a lone long prompt reads within
+  ~1% of the scheduler being off.
+- A 24k-token side prompt beside a generating slot: it starts at once, and the generating slot keeps ~34 tok/s with
+  gaps of at most 0.22 s.
+
+### 9. Short prompts (32-token passes, no graph capture for prompts)
+
+- The tensor-core matvec's single products take passes of 32 tokens (four 8-token tiles over one read and decode of the
+  weights; each column summed in the same order as before, so outputs are bit-identical), and products up to 224
+  tokens stay on it: prompts of 68 / 113 / 171 tokens 202 / 310 / 421 ms -> 168 / 240 / 361. `LLAMA_QPN_W32=0` restores
+  passes of 16.
+- A graph whose products with a weight take more than 64 tokens is no longer captured as a CUDA graph
+  (`GGML_CUDA_GRAPH_MAX_TOKENS`): each prompt length was captured on its second occurrence and seldom replayed.
+
+### 10. Checkpoints
+
+- The checkpoint 4 tokens before a prompt's end, which the next turn of the conversation restores, is written from the
+  recurrent state's rollback snapshot after the first token is out (`llama_memory_rs_view_back`), instead of reading the
+  last 4 tokens as a decode of their own (~50 ms of every prompt's first token). `LLAMA_CKPT_TAIL_SNAP=0` restores it.
+- Two checkpoints are kept on the device as well (`LLAMA_CKPT_DEV`, default 2): a slot's latest tail checkpoint and the
+  last prefix restored from the host, such as a shared system prompt. A restore of a held prefix takes 1.5 ms instead of
+  50 ms over the host link.
+
+### 11. Compaction of a boxed-in prefix
+
+A new conversation keeps the cells of the prefix it restored. When the other slot's conversation sits right after them,
+its prompt went past that conversation and every window spanned it. Before a ubatch of a sequence that cannot grow in
+place, up to 1,024 of its own cells move next to the free run its ubatch will use (`LLAMA_KV_COMPACT_MAX`): a 15.6k-token
+prompt beside a 37k-token resident conversation, 708 -> 933 tok/s.
+
 ## Known limits
 
 - Tested only on V100 PCIe 32 GB with Qwen3.8-27B. The window and placement changes are on for the qwen35 model line
   only.
-- DFlash2 requires `LLAMA_TU=0`, so a long prompt in one slot shares batches with the other slot's decode, and the
-  decoding slot slows down while it reads.
+- Two slots cap combined throughput near the two-slot decode rate (~120 tok/s); a third slot costs ~1 GB of VRAM (its
+  recurrent state and rollback snapshots), about 30k tokens of context.
+- The first two prompts after a start pay ~0.4 s once each to allocate a device checkpoint copy.
 
 ## Credits and license
 
