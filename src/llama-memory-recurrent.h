@@ -93,8 +93,8 @@ public:
     void     rs_apply_pending(llama_seq_id seq_id);
     // the rollback depth of a sequence (n_rs_seq in the uniform layout)
     uint32_t get_rs_depth(llama_seq_id seq_id) const;
-    // the row of a cell's snapshot idx (idx 0: the live row, the cell itself)
-    uint32_t rs_row(uint32_t idx, uint32_t cell) const;
+    // the row of snapshot idx of sequence seq whose live state is in cell (idx 0: that live row)
+    uint32_t rs_row(uint32_t idx, llama_seq_id seq, uint32_t cell) const;
     uint32_t n_seq_max_rs() const { return n_seq_max; }
 
     // per-seq rollback index

@@ -510,13 +510,13 @@ uint32_t llama_memory_recurrent::get_rs_depth(llama_seq_id seq_id) const {
     return seq_id >= 0 && (size_t) seq_id < rs_depth.size() ? rs_depth[seq_id] : 0;
 }
 
-uint32_t llama_memory_recurrent::rs_row(uint32_t idx, uint32_t cell) const {
+// the snapshot rows belong to the sequence, not to the storage cell: after find_slot moves a sequence's state (cell.src0 points
+// at the old cell, which may hold another sequence by now, or none), the caller names the sequence whose rollback idx it reads
+uint32_t llama_memory_recurrent::rs_row(uint32_t idx, llama_seq_id seq, uint32_t cell) const {
     if (idx == 0 || rs_pool == 0) {
         return idx * size + cell;
     }
-    GGML_ASSERT(cell < size && !cells[cell].seq_id.empty());
-    const llama_seq_id seq = *cells[cell].seq_id.begin();
-    GGML_ASSERT((size_t) seq < rs_depth.size() && idx <= rs_depth[seq]);
+    GGML_ASSERT(seq >= 0 && (size_t) seq < rs_depth.size() && idx <= rs_depth[seq]);
     return size + rs_snapbase[seq] + idx - 1;
 }
 
@@ -536,7 +536,7 @@ void llama_memory_recurrent::rs_apply_pending(llama_seq_id seq_id) {
             ggml_reset(bak_view_ctx.get());
         }
         ggml_context * vctx = bak_view_ctx.get();
-        const uint32_t row_src = rs_row(rs_idx[seq_id], (uint32_t) tail);
+        const uint32_t row_src = rs_row(rs_idx[seq_id], seq_id, (uint32_t) tail);
         const uint32_t row_dst = (uint32_t) tail;
         auto copy_row = [&](ggml_tensor * t) {
             if (t == nullptr) {
@@ -1015,6 +1015,7 @@ void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq
         if ((seq_id == -1 && !cell.is_empty()) || cell.has_seq_id(seq_id)) {
             ++cell_count;
             uint32_t rs_idx_cur = 0;
+            llama_seq_id rs_seq = seq_id != -1 ? seq_id : (cell.seq_id.empty() ? -1 : *cell.seq_id.begin());
 
             if (n_rs_seq != 0) {
                 if (seq_id != -1) {
@@ -1036,7 +1037,7 @@ void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq
                 }
             }
 
-            const uint32_t cell_id = rs_row(rs_idx_cur, cell.src >= 0 ? (uint32_t) cell.src : i);
+            const uint32_t cell_id = rs_row(rs_idx_cur, rs_seq, cell.src >= 0 ? (uint32_t) cell.src : i);
             if (cell_ranges_data.empty() || cell_ranges_data.back().second != cell_id) {
                 cell_ranges_data.emplace_back(cell_id, cell_id + 1);
             } else {
@@ -1624,8 +1625,9 @@ int32_t llama_memory_recurrent_context::s_copy(int i) const {
     }
 
     uint32_t idx = 0;
+    llama_seq_id seq = -1;
     if (!mem->cells[cell_idx].seq_id.empty()) {
-        const llama_seq_id seq = *mem->cells[cell_idx].seq_id.begin();
+        seq = *mem->cells[cell_idx].seq_id.begin();
         if (seq >= 0 && (size_t) seq < mem->rs_idx.size()) {
             idx = mem->rs_idx[seq];
             // reset rollback idx
@@ -1638,7 +1640,7 @@ int32_t llama_memory_recurrent_context::s_copy(int i) const {
     if (src0 < 0) {
         return (int32_t)(idx * mem->size) + src0;
     }
-    return (int32_t) mem->rs_row(idx, (uint32_t) src0);
+    return (int32_t) mem->rs_row(idx, seq, (uint32_t) src0);
 }
 
 // [TAG_RS_POOL]
@@ -1715,7 +1717,7 @@ int32_t llama_memory_recurrent_context::rs_snap_row(int i, int j) const {
     if (is_full || ubatches.empty() || cell >= mem->size || mem->cells[cell].seq_id.empty()) {
         return (int32_t) (mem->size + (uint32_t) i*(get_n_snap() - 1) + (uint32_t) j - 1);
     }
-    return (int32_t) mem->rs_row((uint32_t) j, cell);
+    return (int32_t) mem->rs_row((uint32_t) j, *mem->cells[cell].seq_id.begin(), cell);
 }
 
 void llama_memory_recurrent_context::tu_capture(llama_seq_id seq_id, int32_t * rs_idx_out) {
