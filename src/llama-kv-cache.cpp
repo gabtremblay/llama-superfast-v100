@@ -1468,6 +1468,107 @@ const llama_kv_cells & llama_kv_cache::get_cells(llama_seq_id seq_id) const {
     return v_cells[seq_to_stream[seq_id]];
 }
 
+// [TAG_KV_COMPACT] a new conversation in a unified cache keeps the cells of the prefix it restored (a shared system prompt), which sat
+// before the other slot's conversation: with no room after them, its prompt went past the other conversation, and every window of it
+// spanned that conversation's cells, masked but read (a 47k-token prompt beside a 47k-token resident conversation)
+bool llama_kv_cache::seq_compact(llama_seq_id seq_id, uint32_t n_next, const std::function<void()> & sync) {
+    static const uint32_t max_cells = [] {
+        const char * e = getenv("LLAMA_KV_COMPACT_MAX");
+        return e ? (uint32_t) std::max(0, atoi(e)) : 1024u;
+    }();
+    if (!kv_window || max_cells == 0 || n_stream != 1 || v_trans || seq_id < 0 || n_next == 0) {
+        return false;
+    }
+    auto & cells = v_cells[0];
+
+    // the sequence's cells, none of them shared with another sequence
+    std::vector<uint32_t> idx;
+    int64_t last = -1;
+    for (uint32_t i = cells.used_min(); i < cells.used_max_p1(); ++i) {
+        if (cells.is_empty(i) || !cells.seq_has(i, seq_id)) {
+            continue;
+        }
+        if (cells.seq_count(i) != 1 || idx.size() >= max_cells) {
+            return false;
+        }
+        idx.push_back(i);
+        if (last < 0 || cells.pos_get(i) > cells.pos_get((uint32_t) last)) {
+            last = i;
+        }
+    }
+    if (idx.empty()) {
+        return false;
+    }
+
+    // it grows in place: the cells after its last are free
+    if ((uint64_t) last + 1 + n_next <= cells.size()) {
+        bool room = true;
+        for (uint32_t k = 1; k <= n_next && room; ++k) {
+            room = cells.is_empty((uint32_t) last + k);
+        }
+        if (room) {
+            return false;
+        }
+    }
+
+    // the largest free run, if it holds the cells and the ubatch
+    uint32_t best = 0, best_len = 0, run = 0;
+    for (uint32_t j = 0; j <= cells.size(); ++j) {
+        if (j < cells.size() && cells.is_empty(j)) {
+            ++run;
+            continue;
+        }
+        if (run > best_len) {
+            best_len = run;
+            best     = j - run;
+        }
+        run = 0;
+    }
+    if (best_len < idx.size() + n_next) {
+        return false;
+    }
+
+    std::sort(idx.begin(), idx.end(), [&](uint32_t a, uint32_t b) { return cells.pos_get(a) < cells.pos_get(b); });
+
+    // no decode may be reading or writing the cache while its rows move
+    sync();
+    for (auto & layer : layers) {
+        for (ggml_tensor * t : { layer.k_stream[0], layer.v_stream[0] }) {
+            if (t == nullptr) {
+                continue;
+            }
+            for (size_t j = 0; j < idx.size(); ) {
+                size_t n = 1;
+                while (j + n < idx.size() && idx[j + n] == idx[j] + n) {
+                    ++n;
+                }
+                ggml_tensor s = *t;
+                s.ne[1]    = (int64_t) n;
+                s.data     = (char *) t->data + (size_t) idx[j]*t->nb[1];
+                s.view_src = t->view_src ? t->view_src : t;
+                ggml_tensor d = s;
+                d.data     = (char *) t->data + (size_t) (best + j)*t->nb[1];
+                ggml_backend_tensor_copy(&s, &d);
+                j += n;
+            }
+        }
+    }
+    for (size_t j = 0; j < idx.size(); ++j) {
+        const llama_pos p = cells.pos_get(idx[j]);
+        cells.rm(idx[j]);
+        cells.pos_set(best + (uint32_t) j, p);
+        cells.seq_add(best + (uint32_t) j, seq_id);
+    }
+    v_heads[0] = best + (uint32_t) idx.size();
+
+    static const bool wlog = getenv("LLAMA_KV_WINDOW_LOG") != nullptr;
+    if (wlog) {
+        fprintf(stderr, "kv compact: seq %d, %zu cells moved to %u..%u (run of %u) before a ubatch of %u tokens\n", seq_id, idx.size(),
+                best, best + (uint32_t) idx.size() - 1, best_len, n_next);
+    }
+    return true;
+}
+
 // [TAG_TU_UNIFIED] only the sequence's own cells: in a unified cache the stream also holds the other slots' cells, which
 // their decodes between the job's groups add and remove
 uint64_t llama_kv_cache::tu_seq_hash(llama_seq_id seq_id) const {

@@ -498,6 +498,7 @@ private:
     bool                       tu_job_extract  = false; // extract_ubatch_outputs is called from job_step
 
     bool tu_feat_any() const; // a layer input is enabled
+    void kv_compact(const llama_batch & b); // [TAG_KV_COMPACT]
     bool tu_feat_reserve();   // allocates tu_feat for the enabled layers, once
 
     // the layer range of the graph being built (graph_params)

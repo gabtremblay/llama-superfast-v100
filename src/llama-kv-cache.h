@@ -5,6 +5,7 @@
 #include "llama-kv-cells.h"
 #include "llama-memory.h"
 
+#include <functional>
 #include <unordered_map>
 #include <vector>
 
@@ -177,6 +178,12 @@ public:
     // a hash of the cells of the stream that holds seq_id (their positions and sequences), which must not change
     // between the groups of a prompt job's ubatch
     uint64_t tu_seq_hash(llama_seq_id seq_id) const;
+
+    // [TAG_KV_COMPACT] before a ubatch of n_next tokens of seq_id alone: if its cells cannot grow in place (the cells after its
+    // last are taken) and it holds at most LLAMA_KV_COMPACT_MAX cells (default 1024; 0: off) of its own, they move to the start of
+    // the largest free run that holds them and the ubatch, so find_slot places the ubatch right after them and the sequence's
+    // window does not span the cells between. Returns true if it moved them
+    bool seq_compact(llama_seq_id seq_id, uint32_t n_next, const std::function<void()> & sync);
 
     // turn on the change journal of every cells array (llama_kv_cells::jrnl_enable)
     void cells_jrnl_enable();

@@ -2221,6 +2221,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
         inj_arena_swap();
     }
 
+    // [TAG_KV_COMPACT] not between a job's groups: its cells and window are fixed until it ends
+    if (!tu_job.active) {
+        kv_compact(batch_inp);
+    }
+
     llama_memory_context_ptr mctx;
 
     while (true) {
@@ -2730,6 +2735,28 @@ bool llama_context::job_supported() const {
     return true;
 }
 
+// [TAG_KV_COMPACT] llama_kv_cache::seq_compact for a batch of one sequence in a unified cache
+void llama_context::kv_compact(const llama_batch & b) {
+    if (!cparams.kv_unified || b.n_tokens <= 0) {
+        return;
+    }
+    const llama_seq_id s0 = b.seq_id != nullptr ? b.seq_id[0][0] : 0;
+    for (int32_t i = 0; b.seq_id != nullptr && i < b.n_tokens; ++i) {
+        if ((b.n_seq_id != nullptr && b.n_seq_id[i] != 1) || b.seq_id[i][0] != s0) {
+            return;
+        }
+    }
+    llama_kv_cache * kv = nullptr;
+    if (auto * h = dynamic_cast<llama_memory_hybrid *>(memory.get())) {
+        kv = h->get_mem_attn();
+    } else {
+        kv = dynamic_cast<llama_kv_cache *>(memory.get());
+    }
+    if (kv != nullptr) {
+        kv->seq_compact(s0, (uint32_t) b.n_tokens, [this] { synchronize(); });
+    }
+}
+
 bool llama_context::tu_feat_any() const {
     for (bool b : cparams.embeddings_layer_inp) {
         if (b) {
@@ -2951,6 +2978,9 @@ int32_t llama_context::job_begin(const llama_batch & batch_inp) {
 
     // pending shifts/copies run before the job, as in decode(); none may run while it lives
     memory_update(false);
+
+    // [TAG_KV_COMPACT]
+    kv_compact(batch);
 
     llama_memory_context_ptr mctx;
     bool did_optimize = false;

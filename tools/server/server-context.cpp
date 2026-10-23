@@ -4885,7 +4885,17 @@ private:
     // one step a group
     void tu_slice() {
         const bool peer = tu_peer();
-        const double budget = tu_policy.slice_ms;
+        // [TAG_TU_IDLE_SLICE] with no other slot generating or reading, a slice runs up to LLAMA_TU_IDLE_SLICE_MS (default 400): a
+        // 2048-row group of 4 layers takes ~150 ms, so slices of one group paid a synchronize and the host work between slices 16
+        // times a ubatch (~4% of a long prompt's read); a request that arrives meanwhile is admitted within one such slice
+        static const double idle_slice_ms = [] { const char * e = getenv("LLAMA_TU_IDLE_SLICE_MS"); return e ? atof(e) : 400.0; }();
+        bool other_reader = false;
+        for (const auto & s : slots) {
+            if (&s != tu_job.slot && (s.state == SLOT_STATE_STARTED || s.state == SLOT_STATE_PROCESSING_PROMPT)) {
+                other_reader = true;
+            }
+        }
+        const double budget = peer || other_reader ? (double) tu_policy.slice_ms : std::max<double>(tu_policy.slice_ms, idle_slice_ms);
 
         double  t_slice      = 0.0;
         int     n_run        = 0; // steps in this slice
