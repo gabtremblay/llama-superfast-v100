@@ -594,7 +594,15 @@ static qpn_cfg ggml_cuda_qpn_config(const ggml_type type, const int64_t n, const
             c.stage = 0;
         }
     }
-    if (c.mode != 2 && c.mode != 3 && c.mode != 4 && c.mode != 5) {
+    // [TAG_QPN_NAT2] MODE 6, two row tiles a warp: the Q6_K prototype at 1 to 4 tokens, unstaged, P = 1 (else the streaming loop)
+    if (c.mode == 6 && !(type == GGML_TYPE_Q6_K && T <= 4)) {
+        c.mode = 3;
+    }
+    if (c.mode == 6) {
+        c.stage = 0;
+        c.P     = 1;
+    }
+    if (c.mode != 2 && c.mode != 3 && c.mode != 4 && c.mode != 5 && c.mode != 6) {
         c.mode = 0;
     }
     c.P = std::max(1, std::min(c.P, nsb));
@@ -1206,7 +1214,8 @@ void ggml_cuda_mul_mat_qpn(ggml_backend_cuda_context & ctx, const ggml_tensor * 
             c.mode  = 1;
         }
         c.P = std::max(1, std::min(c.P, nsb));
-        const dim3 grid(nh*((ntiles + c.R - 1)/c.R), c.P), block(WARP_SIZE, c.S*c.R);
+        const int  tpb = c.mode == 6 ? 2*c.R : c.R; // MODE 6: two row tiles a warp
+        const dim3 grid(nh*((ntiles + tpb - 1)/tpb), c.P), block(WARP_SIZE, c.S*c.R);
         const size_t smem = c.stage ? ggml_cuda_qpn_stage_bytes(nsb, c.P, T) : 0;
         const std::string key = qpn_log_launch("mul", { src0 }, T, grid, block, c.mode, c.stage);
         const int NL = T > 16 ? 32 : T > 8 ? 16 : T > 4 ? 8 : 4;
