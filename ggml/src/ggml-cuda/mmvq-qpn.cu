@@ -602,7 +602,17 @@ static qpn_cfg ggml_cuda_qpn_config(const ggml_type type, const int64_t n, const
         c.stage = 0;
         c.P     = 1;
     }
-    if (c.mode != 2 && c.mode != 3 && c.mode != 4 && c.mode != 5 && c.mode != 6) {
+    // [TAG_QPN_RING] MODE 7, the producer/consumer weight ring: the Q6_K prototype at 1 to 4 tokens, S = 4, P = 1
+    if (c.mode == 7 && !(type == GGML_TYPE_Q6_K && T <= 4)) {
+        c.mode = 3;
+    }
+    if (c.mode == 7) {
+        c.S     = QPN_RING_S;
+        c.R     = 1;
+        c.stage = 0;
+        c.P     = 1;
+    }
+    if (c.mode != 2 && c.mode != 3 && c.mode != 4 && c.mode != 5 && c.mode != 6 && c.mode != 7) {
         c.mode = 0;
     }
     c.P = std::max(1, std::min(c.P, nsb));
@@ -1215,7 +1225,10 @@ void ggml_cuda_mul_mat_qpn(ggml_backend_cuda_context & ctx, const ggml_tensor * 
         }
         c.P = std::max(1, std::min(c.P, nsb));
         const int  tpb = c.mode == 6 ? 2*c.R : c.R; // MODE 6: two row tiles a warp
-        const dim3 grid(nh*((ntiles + tpb - 1)/tpb), c.P), block(WARP_SIZE, c.S*c.R);
+        // MODE 7: persistent blocks, one per SM, of QPN_RING_S consumer and QPN_RING_NP producer warps
+        const int  nsm = ggml_cuda_info().devices[ctx.device].nsm;
+        const dim3 grid(c.mode == 7 ? std::min((ntiles + QPN_RING_R - 1)/QPN_RING_R, nsm) : nh*((ntiles + tpb - 1)/tpb), c.P),
+                   block(WARP_SIZE, c.mode == 7 ? QPN_RING_S*QPN_RING_R + QPN_RING_NP : c.S*c.R);
         const size_t smem = c.stage ? ggml_cuda_qpn_stage_bytes(nsb, c.P, T) : 0;
         const std::string key = qpn_log_launch("mul", { src0 }, T, grid, block, c.mode, c.stage);
         const int NL = T > 16 ? 32 : T > 8 ? 16 : T > 4 ? 8 : 4;

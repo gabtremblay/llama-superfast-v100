@@ -2003,6 +2003,281 @@ static inline bool ggml_cuda_qpn_full_on() {
     return on;
 }
 
+// [TAG_QPN_RING] MODE 7 (prototype; Q6_K, 1 to 4 tokens, P = 1): a producer/consumer weight ring. ncu on the streaming loop: DRAM
+// at 77% of peak, issue slots 23% busy, 78% of stall samples on L1TEX loads, so the loads in flight do not cover HBM's latency.
+// Persistent blocks (one per SM) loop over the row tiles; each has QPN_RING_S consumer warps (split-K over one tile, as S warps of
+// MODE 3) and QPN_RING_NP producer warps. A producer serves QPN_RING_S/QPN_RING_NP consumers: it loads each one's next
+// tile-superblock (TSB contiguous bytes) into registers for all of them, then waits for a free slot of that consumer's
+// QPN_RING_NS-deep ring in shared memory, stores it and publishes a fill count. A consumer runs the streaming loop's Q6_K arithmetic
+// at LA = 2 expression for expression, with the weight chunks read from its ring slot (activations through __ldg, which stay in
+// the L1 beside the 64 KB carveout), and the S consumers' sums are added in the order sp = 0 .. S-1, so the outputs are
+// bit-identical to MODE 3 at S = 4 (LLAMA_QPN_CHECK=3,1 checks it). The counters are monotonic per consumer, in shared memory.
+// A block takes QPN_RING_R tiles at a time (S*R consumers): at R = 1 (4 consumers, one a scheduler) nothing hid an instruction's
+// latency and the head ran at 1795 us against MODE 3's 1559. A slot is one tile-superblock; at NS = 1 the producer's registers
+// hold the next one, so a consumer's ring is still two deep.
+// One producer a consumer: with a producer serving two consumers in turn, its next loads waited until both had freed their slot,
+// so each round exposed DRAM's latency (ncu, staged at 4 tokens: 17% of stall samples were consumers polling their fill count)
+#define QPN_RING_S  4
+#define QPN_RING_R  2
+#define QPN_RING_NP 8
+#define QPN_RING_NS 1
+static __device__ __forceinline__ void qpn_ring_bar() { // the consumers only (named barrier 1)
+    asm volatile("bar.sync 1, %0;" :: "r"(QPN_RING_S*QPN_RING_R*WARP_SIZE) : "memory");
+}
+
+// STG: the activations staged in shared memory beside the ring (when they fit: K = 5120 at 4 tokens is 40 KB), so a consumer's
+// mma reads its B fragment at shared-memory latency (ncu on the ring with B through __ldg: 16% of stall samples were mma waiting
+// on those loads, L1 hit rate 29%, a consumer ~0.12 instructions a cycle). Lanes of padding tokens read a real token's staged
+// fragment, as MODE 3 staged does (a real token's C column depends only on its own B column)
+template <ggml_type type, int T, bool STG>
+static __global__ void __launch_bounds__((QPN_RING_S*QPN_RING_R + QPN_RING_NP)*WARP_SIZE, 1)
+qpn_ring_kernel(const char * __restrict__ W, const int nsb, const int ntiles, const half * __restrict__ xh, const float * __restrict__ xsc,
+                const float * __restrict__ x, const int64_t stride_col_x, float * __restrict__ dst, const int64_t stride_col_dst) {
+#if defined(VOLTA_MMA_AVAILABLE)
+    static_assert(type == GGML_TYPE_Q6_K && T <= 4, "MODE 7: the Q6_K prototype at 1 to 4 tokens");
+    typedef tile<32, 4, half2>                               tile_A;
+    typedef tile< 8, 4, half2, DATA_LAYOUT_I_MAJOR_MIRRORED> tile_B;
+    typedef tile<32, 8, float>                               tile_C;
+    constexpr int S = QPN_RING_S, R = QPN_RING_R, NC = S*R, NP = QPN_RING_NP, NS = QPN_RING_NS, CPP = NC/NP; // consumers a producer
+    static_assert(NC % NP == 0, "each producer serves the same number of consumers");
+    constexpr int NCH = qpn_t<type>::NCH, TSB = qpn_tsb<type>(), TSB16 = TSB/16;  // Q6_K: 13 chunks + 64 bytes (lanes 0-3)
+    constexpr int NL  = qpn_nl<T>();
+    constexpr int t = T, ts = T;
+    static_assert(TSB == NCH*QPN_CHUNK + 64, "Q6_K's tile-superblock: 13 chunks and the 32 rows' d");
+
+    extern __shared__ uint4 qpn_ring[];          // [NC][NS][TSB16], then (STG) the activations [nsb][32 fragments][t]
+    __shared__ float    red[(S - 1)*R*NL*WARP_SIZE]; // the partial sums of warps sp = 1 .. S-1 of each tile (warp 0 adds them)
+    __shared__ int      filled[NC], consumed[NC];
+    __shared__ unsigned sbad[2];
+    static_assert((S - 1)*R*NL >= NC, "the fallback's column exchange (one value a lane per consumer) fits in red");
+    uint4 * xsm = qpn_ring + NC*NS*TSB16;
+
+    const int lane = threadIdx.x, wy = threadIdx.y;
+    if (wy == 0 && lane < NC) {
+        filled[lane] = consumed[lane] = 0;
+    }
+    if (wy == 0 && lane < 2) {
+        sbad[lane] = 0;
+    }
+    if constexpr (STG) {
+        const int n16 = nsb*32*t;
+        for (int i = wy*WARP_SIZE + lane; i < n16; i += blockDim.y*WARP_SIZE) {
+            xsm[i] = __ldg((const uint4 *) xh + i);
+        }
+    }
+    __syncthreads();
+
+    if (wy >= NC) { // ---- producer p: consumers p, p + NP, ... (consumer c: tile c / S of the group, superblocks c % S + i*S)
+        const int p = wy - NC;
+        int seq[CPP] = {};
+        for (int tg = blockIdx.x; tg*R < ntiles; tg += gridDim.x) {
+            for (int i = 0; S*i < nsb; ++i) {
+                uint4 v[CPP][NCH + 1];
+#pragma unroll
+                for (int k = 0; k < CPP; ++k) {
+                    const int c = p + k*NP, tile = tg*R + c / S, sb = c % S + i*S;
+                    if (tile < ntiles && sb < nsb) {
+                        const char * src = W + ((int64_t) tile*nsb + sb)*TSB + lane*16;
+#pragma unroll
+                        for (int ch = 0; ch < NCH; ++ch) {
+                            v[k][ch] = qpn_ldg_w(src + ch*QPN_CHUNK);
+                        }
+                        v[k][NCH] = lane < 4 ? qpn_ldg_w(src + NCH*QPN_CHUNK) : make_uint4(0, 0, 0, 0);
+                    }
+                }
+#pragma unroll
+                for (int k = 0; k < CPP; ++k) {
+                    const int c = p + k*NP, tile = tg*R + c / S, sb = c % S + i*S;
+                    if (tile >= ntiles || sb >= nsb) {
+                        continue;
+                    }
+                    const int n = seq[k]++;
+                    while (n - *(volatile int *) &consumed[c] >= NS) { }
+                    uint4 * slot = qpn_ring + (c*NS + n % NS)*TSB16;
+#pragma unroll
+                    for (int ch = 0; ch < NCH; ++ch) {
+                        slot[ch*WARP_SIZE + lane] = v[k][ch];
+                    }
+                    if (lane < 4) {
+                        slot[NCH*WARP_SIZE + lane] = v[k][NCH];
+                    }
+                    __syncwarp();
+                    __threadfence_block();
+                    if (lane == 0) {
+                        *(volatile int *) &filled[c] = n + 1;
+                    }
+                }
+            }
+        }
+        return;
+    }
+
+    // ---- consumer wy: warp sp of the group's tile wy / S
+    const int sp = wy % S;
+    const int nB = min(tile_B::get_i(0), t - 1);
+    const int r0 = lane & ~2, c0 = lane & 2;
+    const int dw = NCH*QPN_CHUNK/4 + (r0 >> 2)*2 + (r0 & 1); // u32 index in the slot of Q6_K's d(r0), d(r0 + 2)
+    const uint32_t mg = QPN_MAGIC | __ldg(&qpn_zero_x[0].x);
+    int n = 0, par = 0;
+    for (int tg = blockIdx.x; tg*R < ntiles; tg += gridDim.x, par ^= 1) {
+        const int  tile = tg*R + wy / S;
+        const bool act  = tile < ntiles;
+        float    D[NL] = {0.0f};
+        unsigned bad   = 0;
+        for (int sb = sp; act && sb < nsb; sb += S, ++n) {
+            while (*(volatile int *) &filled[wy] <= n) { }
+            __threadfence_block();
+            const uint4 * sl = qpn_ring + (wy*NS + n % NS)*TSB16;
+            const uint4 hdr = sl[12*WARP_SIZE + lane];
+            const uint2 tl  = make_uint2(((const uint32_t *) sl)[dw], 0);
+            uint32_t scu[4];
+            scu[0] = hdr.x ^ 0x80808080u; scu[1] = hdr.y ^ 0x80808080u; scu[2] = hdr.z ^ 0x80808080u; scu[3] = hdr.w ^ 0x80808080u;
+            const int nBr = tile_B::get_i(0);
+            const uint4 * xk = STG ? xsm + (sb*32*t + nB) : nBr < t ? (const uint4 *) xh + ((int64_t) sb*32*ts + nB) : qpn_zero_x + nBr;
+            float cs[NL/2];
+#pragma unroll
+            for (int i = 0; i < NL/2; ++i) {
+                const int col = c0 + (i & 1) + 4*(i/2);
+                cs[i] = col < t ? xsc[sb*ts + col] : 1.0f;
+                bad |= (col < t && cs[i] == 0.0f) ? 1u << col : 0u;
+            }
+            tile_C Ds[2];
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const uint4    cw     = sl[j*WARP_SIZE + lane];
+                const uint32_t cwv[4] = {cw.x, cw.y, cw.z, cw.w};
+                const uint4    hc     = sl[(8 + j/2)*WARP_SIZE + lane];
+                const uint32_t hcv[2] = {(j & 1) ? hc.z : hc.x, (j & 1) ? hc.w : hc.y};
+#pragma unroll
+                for (int q = 0; q < 4; ++q) {
+                    const int   sbi = 2*j + q/2;
+                    const half2 sc  = __hsub2(qpn_u2h(__byte_perm(scu[sbi/4], 0x64, (sbi % 4) | (4 << 4) | ((sbi % 4) << 8) | (4 << 12))),
+                                              make_half2(1152.0f, 1152.0f));
+                    const half2 s16 = __hmul2(sc, make_half2(0.0625f, 0.0625f));
+                    const half2 z   = __hmul2(sc, make_half2(-96.0f, -96.0f));
+                    const uint32_t H = hcv[q/2];
+                    tile_A A;
+                    qpn_decode<type>(A, cwv[q], __funnelshift_r(H, H, 2*(q & 1)), s16, z, mg);
+                    tile_B B;
+                    *(uint4 *) B.x = STG ? xk[(4*j + q)*t] : __ldg(xk + (4*j + q)*ts);
+                    mma(Ds[q & 1], A, B);
+                }
+            }
+            __syncwarp();
+            __threadfence_block();
+            if (lane == 0) {
+                *(volatile int *) &consumed[wy] = n + 1;
+            }
+            const float2 d02 = __half22float2(qpn_u2h(tl.x));
+#pragma unroll
+            for (int l = 0; l < NL; ++l) {
+                const float d = (l & 2) ? d02.y : d02.x;
+                const float c = cs[qpn_csi(l)];
+                D[l] += c * d * (Ds[0].x[l & 7] + Ds[1].x[l & 7]);
+            }
+        }
+
+        // the tile's S partial sums in the order sp = 0 .. S-1 (qpn_mul_block's at P = 1), then the store
+        if (bad) {
+            atomicOr(&sbad[par], bad);
+        }
+        const int rb = (wy / S)*(S - 1) - 1; // red's slot of warp sp of this tile: rb + sp (sp >= 1)
+        if (S > 1 && sp > 0) {
+#pragma unroll
+            for (int l = 0; l < NL; ++l) {
+                red[((rb + sp)*NL + l)*WARP_SIZE + lane] = D[l];
+            }
+        }
+        qpn_ring_bar();
+        const unsigned badmask = sbad[par];
+        if (sp == 0 && act) {
+            for (int i = 1; i < S; ++i) {
+#pragma unroll
+                for (int l = 0; l < NL; ++l) {
+                    D[l] += red[((rb + i)*NL + l)*WARP_SIZE + lane];
+                }
+            }
+#pragma unroll
+            for (int l = 0; l < NL; ++l) {
+                const int row = tile*32 + r0 + (l & 2);
+                const int col = c0 + qpn_col(l);
+                if (col < t) {
+                    dst[col*stride_col_dst + row] = D[l];
+                }
+            }
+        }
+        if (wy == 0 && lane == 0) {
+            sbad[par ^ 1] = 0; // the next group's
+        }
+        qpn_ring_bar();
+        if (badmask) { // block-uniform: those columns again in fp32 from the dequantized weights
+            float fb[QPN_FB_N];
+            if (act) {
+                qpn_fallback<type>(W + (int64_t) tile*nsb*TSB, sp, nsb, S, badmask, t, x, stride_col_x, fb);
+            } else {
+                for (int c = 0; c < QPN_FB_N; ++c) {
+                    fb[c] = 0.0f;
+                }
+            }
+            for (int c = 0; c < t; ++c) {
+                if (!((badmask >> c) & 1)) {
+                    continue;
+                }
+                red[wy*WARP_SIZE + lane] = fb[c];
+                qpn_ring_bar();
+                if (sp == 0 && act) {
+#pragma unroll
+                    for (int l = 0; l < NL; ++l) {
+                        if (c0 + qpn_col(l) == c) {
+                            float v = 0.0f;
+                            for (int i = 0; i < S; ++i) {
+                                v += red[(wy + i)*WARP_SIZE + r0 + (l & 2)];
+                            }
+                            dst[c*stride_col_dst + tile*32 + r0 + (l & 2)] = v;
+                        }
+                    }
+                }
+                qpn_ring_bar();
+            }
+        }
+    }
+#else
+    GGML_UNUSED_VARS(W, nsb, ntiles, xh, xsc, x, stride_col_x, dst, stride_col_dst);
+    NO_DEVICE_CODE;
+#endif // defined(VOLTA_MMA_AVAILABLE)
+}
+
+// the ring's dynamic shared memory: QPN_RING_S consumers x QPN_RING_NS slots of one tile-superblock
+template <ggml_type type> static constexpr size_t qpn_ring_smem() { return (size_t) QPN_RING_S*QPN_RING_R*QPN_RING_NS*qpn_tsb<type>(); }
+
+// the activations staged when ring, activations and the static state (about 3.2 KB) fit in the SM's 96 KB
+static constexpr size_t QPN_RING_SMEM_MAX = 96*1024 - 3*1024 - 256;
+
+template <ggml_type type, int T, bool STG>
+static void ggml_cuda_qpn_ring_launch_s(const int device, const dim3 grid, const dim3 block, const size_t smem, cudaStream_t stream, const qpn_args & a) {
+    static bool done[GGML_CUDA_MAX_DEVICES] = { false };
+    if (!done[device]) {
+        CUDA_CHECK(cudaFuncSetAttribute(qpn_ring_kernel<type, T, STG>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+            (int) (STG ? QPN_RING_SMEM_MAX : qpn_ring_smem<type>())));
+        CUDA_CHECK(cudaFuncSetAttribute(qpn_ring_kernel<type, T, STG>, cudaFuncAttributePreferredSharedMemoryCarveout,
+            STG ? (int) cudaSharedmemCarveoutMaxShared : 64*100/96));
+        done[device] = true;
+    }
+    qpn_ring_kernel<type, T, STG><<<grid, block, smem, stream>>>(a.W, a.nsb, a.ntiles, a.xh, a.xsc, a.x, a.stride_col_x,
+        a.dst, a.stride_col_dst);
+}
+
+template <ggml_type type, int T>
+static bool ggml_cuda_qpn_ring_launch(const int device, const dim3 grid, const dim3 block, cudaStream_t stream, const qpn_args & a) {
+    const size_t act = (size_t) a.nsb*32*T*sizeof(uint4);
+    if (qpn_ring_smem<type>() + act <= QPN_RING_SMEM_MAX) {
+        ggml_cuda_qpn_ring_launch_s<type, T, true>(device, grid, block, qpn_ring_smem<type>() + act, stream, a);
+    } else {
+        ggml_cuda_qpn_ring_launch_s<type, T, false>(device, grid, block, qpn_ring_smem<type>(), stream, a);
+    }
+    return false;
+}
+
 // mode 0: the whole-superblock loop at QPN_MIN_BLOCKS blocks per SM, one kernel per T; 2, 3, 4: qpn_stream_loop at that many
 // blocks of 8 warps per SM, one kernel per T at 1 to 4 tokens and
 // one kernel at T = 8 for 5 to 8 tokens; at exactly 8 tokens, unstaged, its QPN_FULL variant
@@ -2032,6 +2307,12 @@ static bool ggml_cuda_qpn_launch_t(const bool stage, const int mode, const dim3 
                 return ggml_cuda_qpn_launch_m<type, T, false, 6>(device, grid, block, smem, stream, a, T);
             }
             GGML_ABORT("MODE 6 is the Q6_K prototype at 1 to 4 tokens");
+        case 7: // [TAG_QPN_RING] the producer/consumer weight ring: the Q6_K prototype at 1 to 4 tokens, P = 1
+            if constexpr (type == GGML_TYPE_Q6_K && T <= 4) {
+                GGML_ASSERT(!stage && a.P == 1 && a.nh == 1 && a.S == QPN_RING_S);
+                return ggml_cuda_qpn_ring_launch<type, T>(device, grid, block, stream, a);
+            }
+            GGML_ABORT("MODE 7 is the Q6_K prototype at 1 to 4 tokens");
         default: break;
     }
     return stage ? ggml_cuda_qpn_launch_m<type, T, true, 0>(device, grid, block, smem, stream, a, T) : ggml_cuda_qpn_launch_m<type, T, false, 0>(device, grid, block, smem, stream, a, T);
