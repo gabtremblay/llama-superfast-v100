@@ -4616,6 +4616,18 @@ private:
         return false;
     }
 
+    // [TAG_TU_GEN_JOB_ROWS] with a slot generating, a prompt job takes at most LLAMA_TU_GEN_JOB_ROWS rows (default 1024; 0: n_batch):
+    // a group's time is its rows', so a 2048-row job's groups of ~150 ms left the generating slot one round per group. A 24k-token
+    // read beside a generating slot: that slot 16.9 -> 36.1 tok/s (longest gap 0.30 -> 0.22 s), the read 684 -> 524 tok/s
+    int32_t tu_gen_job_rows() const {
+        static const int32_t v = [] {
+            const char * e = getenv("LLAMA_TU_GEN_JOB_ROWS");
+            const int32_t r = e ? atoi(e) : 1024;
+            return r <= 0 ? INT32_MAX : std::max(64, r);
+        }();
+        return v;
+    }
+
     // the job begins over batch_tu, after this iteration's decode round, and runs its first slice
     void tu_start() {
         server_slot * slot = batch_tu.slot_batched;
@@ -4632,7 +4644,8 @@ private:
         int32_t job_layers = tu_policy.group;
         {
             const int32_t n_rows = std::max<int32_t>(1, batch_tu.size());
-            const int32_t n_ub   = (int32_t) llama_n_ubatch(ctx_tgt);
+            // the rows of a full job: a ubatch, or with a slot generating the job's cap (TAG_TU_GEN_JOB_ROWS)
+            const int32_t n_ub   = tu_peer() ? std::min<int32_t>((int32_t) llama_n_ubatch(ctx_tgt), tu_gen_job_rows()) : (int32_t) llama_n_ubatch(ctx_tgt);
             const int32_t n_lay  = llama_model_n_layer(model_tgt);
             const int32_t layers = group_rows ? (int32_t) std::min<int64_t>(n_lay, (int64_t) tu_policy.group*std::max<int32_t>(1, n_ub/n_rows))
                                               : tu_policy.group;
@@ -5890,8 +5903,10 @@ private:
                     const auto & spans = slot.task->params.message_spans;
                     const auto last_user_pos = spans.last_user_message_pos();
 
+                    // [TAG_TU_GEN_JOB_ROWS] with a slot generating, a prompt job takes at most tu_gen_job_rows() rows
+                    const int32_t n_fill_slot = to_job && !generating.empty() ? std::min<int32_t>(n_fill, tu_gen_job_rows()) : n_fill;
                     // add prompt tokens for processing in the current batch
-                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && pb.size() < n_fill) {
+                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && pb.size() < n_fill_slot) {
                         // get next token to process
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                         if (cur_tok == LLAMA_TOKEN_NULL) {
