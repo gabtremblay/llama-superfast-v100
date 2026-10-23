@@ -1,10 +1,24 @@
 #include "common.cuh"
 #include "ggml.h"
 
-// fused-kernel recurrent-state output; strides in elements (per-seq stride is always D, set in-kernel)
+// [TAG_RS_POOL] the per-sequence bases of rollback slot 1 in the cache (the shared snapshot pool packs a sequence's slots as
+// consecutive rows): p[0] == nullptr means the strided form below
+#define GGML_CUDA_GDN_MAX_SEQS 8
+struct ggml_cuda_gdn_snap_seqs {
+    float * p[GGML_CUDA_GDN_MAX_SEQS];
+};
+
+// fused-kernel recurrent-state output; strides in elements. Rollback slot 0 (the live state) of sequence s is at
+// data + s*D (one cache row a sequence, set in-kernel); slot i >= 1 at snap + s*snap_seq_stride + (i - 1)*slot_stride:
+// the uniform layout keeps snap_seq_stride = D, the shared snapshot pool packs a sequence's slots as consecutive rows
+// (slot_stride = D) with snap_seq_stride = depth*D [TAG_RS_POOL]
 struct ggml_cuda_gated_delta_net_fused_cache {
-    float * data;        // rollback slot 0
-    int64_t slot_stride; // between rollback slots (0 when K==1)
+    float * data;            // rollback slot 0
+    int64_t slot_stride;     // between rollback slots (0 when K==1)
+    float * snap;            // rollback slot 1 of sequence 0
+    int64_t snap_seq_stride; // between the sequences' slot-1 states
+    // or per-sequence bases (the shared snapshot pool): slot i >= 1 of sequence s at snap_seqs.p[s] + (i - 1)*slot_stride
+    ggml_cuda_gdn_snap_seqs snap_seqs = {};
 };
 
 // Producer chains folded into a gated_delta_net launch (planned by ggml_cuda_plan_gdn_folds): the
@@ -40,6 +54,10 @@ struct ggml_cuda_gdn_fold {
     int64_t         head_row  = -1; // fused cache: the cache row of sequence 0's newest snapshot (-1: not fused)
     int64_t         slot_rows = 0;  // fused cache: rows between rollback slots (0 when K == 1)
     int             n_written = 0;  // fused cache: snapshot slots written
+    int64_t         snap_row      = -1; // fused cache: the row of sequence 0's slot 1
+    int64_t         snap_seq_rows = 1;  // fused cache: rows between the sequences' slot-1 states
+    bool            snap_seq_on = false;             // fused cache, per-sequence bases: slot i >= 1 of sequence s at row snap_seq_row[s] + i - 1
+    int64_t         snap_seq_row[GGML_CUDA_GDN_MAX_SEQS] = {};
 };
 
 // a sequence's source row is written by another sequence of the same launch (see ggml_cuda_gdn_fold)
@@ -51,11 +69,18 @@ static __device__ __forceinline__ bool gdn_state_hazard(const ggml_cuda_gdn_fold
     for (int s = 0; s < fd.n_ids; ++s) {
         const int64_t r = fd.ids[s];
         for (int s2 = 0; s2 < fd.n_ids; ++s2) {
-            const int64_t d = r - (fd.head_row + s2);
-            if (s2 == s || d < 0) {
+            if (s2 == s) {
                 continue;
             }
-            hz |= fd.slot_rows == 0 ? d == 0 : (d % fd.slot_rows == 0 && d / fd.slot_rows < fd.n_written);
+            hz |= r == fd.head_row + s2; // slot 0
+            // slots 1 .. n_written - 1 of sequence s2
+            if (fd.snap_seq_on) {
+                const int64_t d = r - fd.snap_seq_row[s2];
+                hz |= d >= 0 && d < fd.n_written - 1;
+            } else {
+                const int64_t d = r - (fd.snap_row + s2*fd.snap_seq_rows);
+                hz |= fd.n_written > 1 && d >= 0 && (fd.slot_rows == 0 ? d == 0 : (d % fd.slot_rows == 0 && d / fd.slot_rows < fd.n_written - 1));
+            }
         }
     }
     return hz;

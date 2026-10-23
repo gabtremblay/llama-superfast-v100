@@ -86,6 +86,15 @@ struct llm_build_delta_net_base : public llm_graph_context {
             int64_t              conv_channels,
             int                  il);
 
+    // [TAG_RS_POOL] the rollback slots a ubatch's graph writes (slot 0 the live state): 1 + n_rs_seq, or with the shared snapshot
+    // pool 1 + the smallest depth of the ubatch's sequences
+    int64_t rs_n_slots(const llm_graph_input_rs * inp) const;
+    // the write of rollback slot `slot` of a recurrent state tensor for the ubatch's n_seqs sequences: src [row_elems, n_seqs]
+    // (any strides). Slot 0 goes to the live rows at the head; the others to the uniform layout's rows (slot*mem_size + head)
+    // or the pool's: one strided view when the sequences' runs are at one stride, else a set_rows with each row named
+    void build_rs_slot_write(llm_graph_input_rs * inp, ggml_tensor * states_all, int64_t row_elems, int64_t n_seqs,
+            int64_t slot, ggml_tensor * src) const;
+
     // run delta-net attention and write the new recurrent state(s) back to ssm_states_all
     // s: (head_v_dim, head_v_dim, num_v_heads, n_seqs); returns output: (head_v_dim, num_v_heads, n_seq_tokens, n_seqs)
     ggml_tensor * build_recurrent_attn(

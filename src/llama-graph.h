@@ -280,12 +280,21 @@ public:
 
     bool can_reuse(const llm_graph_params & params) override;
 
+    // [TAG_RS_POOL] the snapshot rows' reuse check, with the recurrent context given (the hybrid inputs call it with theirs)
+    bool can_reuse_snap(const llama_memory_recurrent_context * recr, const llama_ubatch & ubatch) const;
+
     ggml_tensor * s_copy;  // I32 [n_rs]
 
     // views of s_copy, computed once per graph
     // and shared across layers which use build_rs
     ggml_tensor * s_copy_main;   // I32 [n_seqs]
     ggml_tensor * s_copy_extra;  // I32 [n_rs - n_seqs]
+
+    // [TAG_RS_POOL] the rollback snapshot writes: n_snap slots (slot 0 the live rows); in the shared pool each sequence's slots
+    // 1 .. n_snap - 1 are consecutive rows from snap_row1[seq] (the ubatch's sequence order), fixed at the build as view offsets
+    uint32_t              rs_pool = 0;
+    uint32_t              n_snap  = 1;
+    std::vector<uint32_t> snap_row1;
 
     const llama_memory_recurrent_context * mctx;
 

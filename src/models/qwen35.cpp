@@ -848,8 +848,9 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear_half(
         const auto    kv_head   = mctx_cur->get_head();
         const auto    mem_size  = mctx_cur->get_size();
         const int64_t row_count = (conv_kernel_size - 1) * conv_channels;
-        const size_t  row_size  = ggml_row_size(conv_states_all->type, row_count);
-        const int64_t K         = (int64_t) cparams.n_rs_seq + 1;
+        const int64_t K         = rs_n_slots(inp);
+        GGML_UNUSED(kv_head);
+        GGML_UNUSED(mem_size);
         for (int64_t t = 1; t <= K; ++t) {
             const int64_t s_idx  = cparams.n_rs_seq == 0 ? conv_input->ne[0] - conv_states->ne[0]
                                                         : std::max<int64_t>(0, conv_input->ne[0] - conv_states->ne[0] - K + t);
@@ -860,11 +861,7 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear_half(
                 conv_input->nb[1], conv_input->nb[2],
                 ggml_row_size(conv_input->type, s_idx));
 
-            ggml_tensor * conv_state_update = ggml_view_2d(ctx0, conv_states_all,
-                row_count, n_seqs, conv_states_all->nb[1],
-                (s_slot * mem_size + kv_head) * row_size);
-
-            ggml_build_forward_expand(gf, ggml_cpy(ctx0, conv_state_last, conv_state_update));
+            build_rs_slot_write(inp, conv_states_all, row_count, n_seqs, s_slot, conv_state_last);
         }
     }
 

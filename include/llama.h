@@ -824,6 +824,15 @@ extern "C" {
     LLAMA_API void llama_state_seq_set_device_key(struct llama_context * ctx, int32_t key);
     LLAMA_API void llama_memory_rs_view_end (llama_memory_t mem, llama_seq_id seq_id);
 
+    // [TAG_RS_POOL] the shared rollback snapshot pool (LLAMA_RS_POOL=N rows): the pool's rows (0: every sequence holds n_rs_seq
+    // snapshots of its own), a sequence's depth, and the depth asked for a sequence from now on (the depth granted: at most
+    // n_rs_seq and the pool's free rows; it stays while a prompt job holds the sequence's rows). Set between decodes
+    LLAMA_API uint32_t llama_memory_rs_pool (llama_memory_t mem);
+    LLAMA_API uint32_t llama_memory_rs_depth(llama_memory_t mem, llama_seq_id seq_id);
+    LLAMA_API uint32_t llama_rs_set_depth(struct llama_context * ctx, llama_seq_id seq_id, uint32_t depth);
+    // every sequence's wanted depth at once (n entries, sequences past n want 0); the granted depths come from llama_memory_rs_depth
+    LLAMA_API void     llama_rs_set_depths(struct llama_context * ctx, const uint32_t * depths, size_t n);
+
     // Copy all tokens that belong to the specified sequence to another sequence
     // p0 < 0 : [0,  p1]
     // p1 < 0 : [p0, inf)

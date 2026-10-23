@@ -3531,6 +3531,10 @@ static int ggml_cuda_try_gdn_cache_fusion(
         (gdn->flags & GGML_TENSOR_FLAG_OUTPUT)) {
         return 0;
     }
+    static const bool fuse_on = [] { const char * e = getenv("LLAMA_GDN_CACHE_FUSE"); return e == nullptr || atoi(e) != 0; }(); // 0: the cpy/set_rows run
+    if (!fuse_on) {
+        return 0;
+    }
 
     const ggml_tensor * src_v     = gdn->src[2];
     const int64_t       S_v       = src_v->ne[0];
@@ -3575,14 +3579,80 @@ static int ggml_cuda_try_gdn_cache_fusion(
     // assumes). ggml_cpy pins src to the same element count.
     const std::array<int64_t, GGML_MAX_DIMS> expected_ne = { D, n_seqs, n_written, 1 };
     if (dst->op != GGML_OP_VIEW || dst->type != GGML_TYPE_F32 || dst->data == nullptr ||
-        !std::equal(expected_ne.begin(), expected_ne.end(), dst->ne) ||
         dst->nb[0] != ggml_type_size(GGML_TYPE_F32) || dst->nb[1] != (size_t) ggml_row_size(GGML_TYPE_F32, D)) {
         return 0;
     }
-
-    fused_state_cpy.data        = (float *) dst->data; // rollback group 0 (newest)
-    fused_state_cpy.slot_stride = K > 1 ? (int64_t) (dst->nb[2] / sizeof(float)) : 0;
-    return skip;
+    if (std::equal(expected_ne.begin(), expected_ne.end(), dst->ne)) {
+        // the uniform layout: one cpy of all n_written slots, the slots at dst->nb[2]
+        fused_state_cpy.data            = (float *) dst->data; // rollback group 0 (newest)
+        fused_state_cpy.slot_stride     = K > 1 ? (int64_t) (dst->nb[2] / sizeof(float)) : 0;
+        fused_state_cpy.snap            = fused_state_cpy.data + fused_state_cpy.slot_stride;
+        fused_state_cpy.snap_seq_stride = D;
+        return skip;
+    }
+    // [TAG_RS_POOL] the shared snapshot pool: a cpy of slot 0 alone to the live rows, then (n_written > 1) one cpy a sequence of
+    // its slots 1 .. n_written - 1 (the tail's [D, n_written - 1] at the slot stride) to its run of consecutive cache rows: the
+    // kernel writes those rows itself from the per-sequence bases
+    const std::array<int64_t, GGML_MAX_DIMS> expected_ne0 = { D, n_seqs, 1, 1 };
+    if (!std::equal(expected_ne0.begin(), expected_ne0.end(), dst->ne) || n_seqs > GGML_CUDA_GDN_MAX_SEQS) {
+        return 0;
+    }
+    fused_state_cpy.data            = (float *) dst->data;
+    fused_state_cpy.slot_stride     = 0;
+    fused_state_cpy.snap            = fused_state_cpy.data;
+    fused_state_cpy.snap_seq_stride = D;
+    if (n_written == 1) {
+        return skip;
+    }
+    static const bool log_on = getenv("LLAMA_RS_POOL_LOG") != nullptr;
+    static int        n_log  = 6;
+    int  skip1 = skip;
+    int  why   = 0;
+    const std::array<int64_t, GGML_MAX_DIMS> expected_ne1 = { D, n_written - 1, 1, 1 };
+    for (int64_t s = 0; s < n_seqs && why == 0; ++s) {
+        const ggml_tensor * cpy1 = nullptr;
+        for (int j = node_idx + skip1 + 1; j < cgraph->n_nodes && cpy1 == nullptr; ++j) {
+            const ggml_tensor * n = cgraph->nodes[j];
+            if (ggml_cuda_is_view_or_noop(n)) {
+                continue;
+            }
+            if (n->op != GGML_OP_CPY || (n->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+                why = 1;
+                break;
+            }
+            cpy1  = n;
+            skip1 = j - node_idx;
+        }
+        if (why != 0 || cpy1 == nullptr) {
+            why = why != 0 ? why : 2;
+            break;
+        }
+        const ggml_tensor * src1 = cpy1->src[0];
+        const ggml_tensor * dst1 = cpy1->src[1];
+        if (src1->op != GGML_OP_VIEW || src1->view_src != gdn || src1->view_offs != tail_off + ggml_row_size(GGML_TYPE_F32, D * (n_seqs + s)) ||
+            !std::equal(expected_ne1.begin(), expected_ne1.end(), src1->ne) || src1->nb[1] != (size_t) ggml_row_size(GGML_TYPE_F32, D * n_seqs)) {
+            why = 3;
+            break;
+        }
+        if (dst1->op != GGML_OP_VIEW || dst1->type != GGML_TYPE_F32 || dst1->data == nullptr ||
+            !std::equal(expected_ne1.begin(), expected_ne1.end(), dst1->ne) ||
+            dst1->nb[0] != ggml_type_size(GGML_TYPE_F32) || dst1->nb[1] != (size_t) ggml_row_size(GGML_TYPE_F32, D)) {
+            why = 4;
+            break;
+        }
+        fused_state_cpy.snap_seqs.p[s] = (float *) dst1->data;
+    }
+    if (log_on && n_log > 0) {
+        --n_log;
+        GGML_LOG_WARN("gdn cache fusion (pool): %s (reason %d), n_seqs %lld n_written %lld\n", why == 0 ? "fused" : "not fused", why,
+                      (long long) n_seqs, (long long) n_written);
+    }
+    if (why != 0) {
+        fused_state_cpy.snap_seqs = {};
+        return 0;
+    }
+    fused_state_cpy.slot_stride = D;
+    return skip1;
 }
 
 static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int node_idx, ggml_cuda_topk_moe_args & args) {

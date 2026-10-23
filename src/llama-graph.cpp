@@ -348,6 +348,28 @@ void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
     }
 }
 
+// [TAG_RS_POOL] the slot-1 row of each of the ubatch's sequences
+static std::vector<uint32_t> llm_graph_rs_snap_row1(const llama_memory_recurrent_context * recr, const int64_t n_seqs, const uint32_t n_snap) {
+    std::vector<uint32_t> rows;
+    if (n_snap > 1) {
+        rows.resize(n_seqs);
+        for (int64_t i = 0; i < n_seqs; ++i) {
+            rows[i] = (uint32_t) recr->rs_snap_row((int) i, 1);
+        }
+    }
+    return rows;
+}
+
+bool llm_graph_input_rs::can_reuse_snap(const llama_memory_recurrent_context * recr, const llama_ubatch & ubatch) const {
+    if (rs_pool == 0) {
+        return true;
+    }
+    bool res = true;
+    res &= n_snap == recr->get_n_snap();
+    res &= snap_row1 == llm_graph_rs_snap_row1(recr, ubatch.n_seqs, n_snap); // the rows are view offsets in the graph
+    return res;
+}
+
 bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
     const auto * mctx = static_cast<const llama_memory_recurrent_context *>(params.mctx);
 
@@ -362,6 +384,9 @@ bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
 
     res &= head == mctx->get_head();
     res &= rs_z == mctx->get_rs_z();
+
+    // [TAG_RS_POOL] the slot count sizes the writes and the row table (its values are an input)
+    res &= can_reuse_snap(mctx, params.ubatch);
 
     return res;
 }
@@ -1134,6 +1159,7 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
             data[i] = mctx->get_recr()->s_copy(i);
         }
     }
+
 }
 
 bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
@@ -1151,6 +1177,7 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
     res &= (inp_attn->self_kv_count != nullptr) == mctx->get_attn()->is_whole();
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
+    res &= inp_rs->can_reuse_snap(mctx->get_recr(), params.ubatch); // [TAG_RS_POOL]
 
     res &= inp_rs->s_copy_main->ne[0]  == params.ubatch.n_seqs;
     res &= inp_rs->s_copy_extra->ne[0] == mctx->get_recr()->get_n_rs() - params.ubatch.n_seqs;
@@ -1180,6 +1207,7 @@ void llm_graph_input_mem_hybrid_k::set_input(const llama_ubatch * ubatch) {
             data[i] = mctx->get_recr()->s_copy(i);
         }
     }
+
 }
 
 bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
@@ -1194,6 +1222,7 @@ bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
     res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams);
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
+    res &= inp_rs->can_reuse_snap(mctx->get_recr(), params.ubatch); // [TAG_RS_POOL]
 
     res &= inp_rs->s_copy_main->ne[0]  == params.ubatch.n_seqs;
     res &= inp_rs->s_copy_extra->ne[0] == mctx->get_recr()->get_n_rs() - params.ubatch.n_seqs;
@@ -4015,6 +4044,13 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
 
     inp->head = mctx_cur->get_head();
     inp->rs_z = mctx_cur->get_rs_z();
+
+    // [TAG_RS_POOL] each sequence's slot-1 row, fixed at the build (the memory context is applied before it)
+    inp->rs_pool = mctx_cur->get_rs_pool();
+    if (inp->rs_pool > 0) {
+        inp->n_snap    = mctx_cur->get_n_snap();
+        inp->snap_row1 = llm_graph_rs_snap_row1(mctx_cur, n_seqs, inp->n_snap);
+    }
 
     return inp;
 }

@@ -74,6 +74,29 @@ public:
     // number of recurrent-state snapshots per seq for rollback; tensors are widened to (1 + n_rs_seq) groups
     uint32_t n_rs_seq = 0;
 
+    // [TAG_RS_POOL] LLAMA_RS_POOL=N: the rollback snapshots of all sequences share N rows after the live rows (rows 0 .. size-1 are
+    // the cells' live states as before), instead of (1 + n_rs_seq) rows a cell. Each sequence holds rs_depth[seq] <= n_rs_seq
+    // snapshots at rows size + rs_snapbase[seq] + 0 .. depth-1 (snapshot j at + j - 1), the sequences packed in seq order, so
+    // sequences of equal depth in consecutive cells have their slot-j rows at a uniform stride of depth rows (the fused graph
+    // write). set_rs_depth re-packs the bases, which only moves rows that hold no valid snapshot (they are consumed within a
+    // round), never a live row. 0: the uniform layout
+    uint32_t rs_pool = 0;
+    std::vector<uint32_t> rs_depth;    // per seq
+    std::vector<uint32_t> rs_snapbase; // per seq, rows from the pool's start
+    std::vector<uint8_t>  rs_lock;     // per seq: a prompt job holds its rows (tu_capture), no re-packing past it
+
+    // every sequence's wanted depth at once (the plan: see set_rs_depths), or one sequence's; the depth granted is at most
+    // n_rs_seq and what the pool's free rows hold, and a prompt job's sequence keeps its run until the job ends
+    void     set_rs_depths(const std::vector<uint32_t> & want);
+    uint32_t set_rs_depth(llama_seq_id seq_id, uint32_t depth);
+    // a rollback snapshot still to be read goes to the live row now (the caller synchronized the device)
+    void     rs_apply_pending(llama_seq_id seq_id);
+    // the rollback depth of a sequence (n_rs_seq in the uniform layout)
+    uint32_t get_rs_depth(llama_seq_id seq_id) const;
+    // the row of a cell's snapshot idx (idx 0: the live row, the cell itself)
+    uint32_t rs_row(uint32_t idx, uint32_t cell) const;
+    uint32_t n_seq_max_rs() const { return n_seq_max; }
+
     // per-seq rollback index
     std::vector<uint32_t> rs_idx;
 
@@ -213,6 +236,14 @@ public:
 
     int32_t s_copy(int i) const;
 
+    // [TAG_RS_POOL] the rollback slots this ubatch's graph writes (1 + the smallest depth of its sequences; 1 + n_rs_seq in the
+    // uniform layout), and where: rs_snap_geom gives the row of sequence 0's slot 1 and the stride in rows between the
+    // sequences' slot-1 rows when the slots form one strided view (true), rs_snap_row the row of ubatch state i's slot j
+    uint32_t get_rs_pool() const;
+    uint32_t get_n_snap() const;
+    bool     rs_snap_geom(uint32_t & row0, uint32_t & seq_rows) const;
+    int32_t  rs_snap_row(int i, int j) const;
+
     // commit once, restore only: after apply(), the bindings that this ubatch's graphs read from the cache (head, n,
     // rs_z and the copy sources, whose read consumes the rollback index) are captured once; from then on the getters and s_copy
     // return the capture and no longer read the live cache. rs_idx_out: the rollback index consumed for seq_id (-1: none)
@@ -225,6 +256,7 @@ private:
         uint32_t             head = 0;
         uint32_t             n    = 0;
         int32_t              rs_z = -1;
+        llama_seq_id         seq  = -1; // the job's sequence, whose pool rows stay locked until tu_release
         std::vector<int32_t> s_copy;
     } cap;
 

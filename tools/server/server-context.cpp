@@ -3721,13 +3721,21 @@ private:
     // checkpoint replay, the draft sampled every drafted token (a non-empty q row holding it), the target's sampler
     // can take the step, and no rollback of this round can need a checkpoint restore, whose replay re-verifies the
     // emitted tokens with sample-and-match
+    // [TAG_RS_POOL] the rollback snapshots the slot's sequence holds (every sequence holds n_rs_seq without the pool)
+    std::vector<uint32_t> rs_want_last; // the depths last asked of the pool, per slot id
+
+    uint32_t rs_depth(const server_slot & slot) const {
+        llama_memory_t mem = llama_get_memory(ctx_tgt);
+        return llama_memory_rs_pool(mem) > 0 ? llama_memory_rs_depth(mem, slot.id) : llama_n_rs_seq(ctx_tgt);
+    }
+
     bool rejection_round(const server_slot & slot, size_t n_draft) const {
         if (!common_speculative_rejection() || slot.spec_is_replay || slot.spec_q.size() != n_draft || n_draft != slot.spec_draft.size() ||
                 !common_sampler_rejection_ok(slot.smpl.get())) {
             return false;
         }
         if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
-                (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_draft > llama_n_rs_seq(ctx_tgt))) {
+                (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_draft > rs_depth(slot))) {
             return false;
         }
         for (size_t i = 0; i < n_draft; ++i) {
@@ -5172,8 +5180,40 @@ private:
         // track if given slot can be batched with slots already in the batch
         auto & slot_batched = batch.slot_batched;
 
+        // [TAG_RS_POOL] with the shared snapshot pool, the active slots (reading or generating) share its rows this round:
+        // each takes the launch's n-max, or the pool's rows over the active slots. Set between decodes, before the drafts
+        {
+            llama_memory_t mem  = llama_get_memory(ctx_tgt);
+            const uint32_t pool = llama_memory_rs_pool(mem);
+            if (pool > 0) {
+                uint32_t n_active = 0;
+                for (const auto & s : slots) {
+                    n_active += s.is_processing() ? 1 : 0;
+                }
+                const uint32_t n_max = spec ? (uint32_t) common_speculative_n_max(spec.get()) : llama_n_rs_seq(ctx_tgt);
+                std::vector<uint32_t> want(slots.size(), 0);
+                for (const auto & s : slots) {
+                    if (s.id >= 0 && (size_t) s.id < want.size()) {
+                        want[s.id] = s.is_processing() && n_active > 0 ? std::min<uint32_t>(n_max, pool / n_active) : 0;
+                    }
+                }
+                // once per change of the wants (the plan may grant less; asking again each round would re-plan each round)
+                if (want != rs_want_last) {
+                    llama_rs_set_depths(ctx_tgt, want.data(), want.size()); // synchronizes the device when a pending snapshot moves
+                    rs_want_last = want;
+                }
+            }
+        }
+
         std::vector<server_slot *> generating;
         std::vector<server_slot *> drafting;
+
+        // [TAG_SPEC_WIDTH_SLOTS] the slots that will generate this round, counted before the loop below fills `generating`
+        // (inside it, the first slot drafted while it still counted only itself)
+        int32_t n_gen_round = 0;
+        for (const auto & s : slots) {
+            n_gen_round += (s.state == SLOT_STATE_GENERATING && !s.tu_hold && tu_fill_slot == nullptr) ? 1 : 0;
+        }
 
         // determine which slots are generating and drafting
         // none in a reader's batch alone (tu_read_other): the decode round ran before it
@@ -5229,10 +5269,26 @@ private:
                         // 16 rows, 158 at 24), and three slots at n-max 7 (24 rows) decoded no faster together than two. So each
                         // slot drafts at most 16 / n_generating - 1 tokens: 7 at one or two slots, 4 at three, 3 at four (three
                         // slots: 93 -> 121 tok/s together). LLAMA_SPEC_WIDTH_SLOTS sets the budget in rows (default 16; 0 = off)
-                        static const int32_t width_rows = [] { const char * e = getenv("LLAMA_SPEC_WIDTH_SLOTS"); return e ? atoi(e) : 16; }();
-                        if (width_rows > 0 && !generating.empty()) {
-                            ada_w = std::max<int32_t>(1, std::min<int32_t>(ada_w, width_rows / (int32_t) generating.size() - 1));
+                        // Two slots do better within one 8-row pass (3 drafted each; genlong on the 245,760 pool: 110.7 tok/s together
+                        // against 92.4 at 7 each and 84.4 at 6 each), so the budget is 8 rows up to two slots, 16 from three
+                        // (LLAMA_SPEC_WIDTH_SLOTS="8,16"; 0 = off)
+                        static const std::pair<int32_t, int32_t> width_rows = [] {
+                            const char * e = getenv("LLAMA_SPEC_WIDTH_SLOTS");
+                            std::pair<int32_t, int32_t> r = { 8, 16 };
+                            if (e != nullptr) {
+                                r.first = atoi(e);
+                                const char * c = strchr(e, ',');
+                                r.second = c != nullptr ? atoi(c + 1) : r.first;
+                            }
+                            return r;
+                        }();
+                        const int32_t n_gen = std::max<int32_t>(n_gen_round, (int32_t) generating.size());
+                        const int32_t rows  = n_gen <= 2 ? width_rows.first : width_rows.second;
+                        if (rows > 0 && n_gen > 1) {
+                            ada_w = std::max<int32_t>(1, std::min<int32_t>(ada_w, rows / n_gen - 1));
                         }
+                        // [TAG_RS_POOL] and within the rollback snapshots the slot holds this round (0: no draft)
+                        ada_w = std::min<int32_t>(ada_w, (int32_t) rs_depth(slot));
                         const int32_t ada_cap  = ada_w < ada_full ? ada_w : 0;
 
                         common_speculative_get_draft_params(spec.get(), slot.id) = {
@@ -5286,7 +5342,7 @@ private:
             if (!draft.empty()) {
                 const bool use_ckpt_tgt =
                     ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
-                   (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && draft.size() > llama_n_rs_seq(ctx_tgt));
+                   (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && draft.size() > rs_depth(slot));
 
                 const bool use_ckpt_dft =
                    (ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && draft.size() > llama_n_rs_seq(ctx_dft));
@@ -5976,7 +6032,7 @@ private:
                                 const int n_last = std::min(n_batch, offset);
                                 if (slot.task->n_tokens() == slot.prompt.n_tokens() + n_last) {
                                     if (offset == 4 && tail_snap && !to_job && !has_mtmd && pb.size() > n_tokens_prev &&
-                                            llama_n_rs_seq(ctx_tgt) >= 4) {
+                                            rs_depth(slot) >= 4) {
                                         slot.ckpt_tail = 4;
                                         break;
                                     }
@@ -6447,7 +6503,7 @@ private:
 
                 const bool use_ckpt_tgt =
                     ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
-                    (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_rollback > llama_n_rs_seq(ctx_tgt));
+                    (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_rollback > rs_depth(slot));
 
                 // check for partial draft acceptance
                 if (n_rollback > 0) {

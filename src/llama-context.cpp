@@ -6208,6 +6208,36 @@ void llama_memory_rs_view_end(llama_memory_t mem, llama_seq_id seq_id) {
     }
 }
 
+// [TAG_RS_POOL]
+uint32_t llama_memory_rs_pool(llama_memory_t mem) {
+    auto * r = mem ? llama_memory_get_recr(mem) : nullptr;
+    return r != nullptr ? r->rs_pool : 0;
+}
+
+uint32_t llama_memory_rs_depth(llama_memory_t mem, llama_seq_id seq_id) {
+    auto * r = mem ? llama_memory_get_recr(mem) : nullptr;
+    return r != nullptr ? r->get_rs_depth(seq_id) : 0;
+}
+
+uint32_t llama_rs_set_depth(llama_context * ctx, llama_seq_id seq_id, uint32_t depth) {
+    auto * r = llama_memory_get_recr(llama_get_memory(ctx));
+    if (r == nullptr) {
+        return 0;
+    }
+    // a pending rollback snapshot may move with its sequence's run: the device must be done with the last decode's writes
+    llama_synchronize(ctx);
+    return r->set_rs_depth(seq_id, depth);
+}
+
+void llama_rs_set_depths(llama_context * ctx, const uint32_t * depths, size_t n) {
+    auto * r = llama_memory_get_recr(llama_get_memory(ctx));
+    if (r == nullptr || r->rs_pool == 0) {
+        return;
+    }
+    llama_synchronize(ctx);
+    r->set_rs_depths(std::vector<uint32_t>(depths, depths + n));
+}
+
 bool llama_memory_can_shift(llama_memory_t mem) {
     if (!mem) {
         return false;

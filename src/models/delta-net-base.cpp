@@ -499,7 +499,7 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
         // this logic assumes that the last (n_rs_seq + 1) tokens of a sequence in a batch are inside
         //   the same ubatch, which `split_equal()` guarantees via its n_keep_tail argument
 
-        const int64_t K = (int64_t) cparams.n_rs_seq + 1;
+        const int64_t K = rs_n_slots(inp);
 
         for (int64_t t = 1; t <= K; ++t) {
             const int64_t s_idx  = std::max<int64_t>(0, conv_input->ne[0] - conv_states->ne[0] - K + t);
@@ -511,17 +511,37 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
                         conv_input->nb[1], conv_input->nb[2],
                         ggml_row_size(conv_input->type, s_idx));
 
-            ggml_tensor * conv_state_update =
-                ggml_view_2d(ctx0,
-                        conv_states_all, row_count, n_seqs,
-                        conv_states_all->nb[1],
-                        (s_slot * mem_size + kv_head) * row_size);
-
-            ggml_build_forward_expand(gf, ggml_cpy(ctx0, conv_state_last, conv_state_update));
+            build_rs_slot_write(inp, conv_states_all, row_count, n_seqs, s_slot, conv_state_last);
         }
     }
 
     return conv_input;
+}
+
+int64_t llm_build_delta_net_base::rs_n_slots(const llm_graph_input_rs * inp) const {
+    return inp->rs_pool > 0 ? (int64_t) inp->n_snap : (int64_t) cparams.n_rs_seq + 1;
+}
+
+void llm_build_delta_net_base::build_rs_slot_write(llm_graph_input_rs * inp, ggml_tensor * states_all, int64_t row_elems, int64_t n_seqs,
+        int64_t slot, ggml_tensor * src) const {
+    const auto *   mctx_cur = inp->mctx;
+    const auto     kv_head  = mctx_cur->get_head();
+    const auto     mem_size = mctx_cur->get_size();
+    const size_t   row_size = ggml_row_size(states_all->type, row_elems);
+
+    if (slot == 0 || inp->rs_pool == 0) {
+        ggml_tensor * dst = ggml_view_2d(ctx0, states_all, row_elems, n_seqs, states_all->nb[1], ((size_t) slot * mem_size + kv_head) * row_size);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, src, dst));
+        return;
+    }
+    GGML_ASSERT(slot < (int64_t) inp->n_snap && (int64_t) inp->snap_row1.size() >= n_seqs);
+    // one cpy a sequence: src is [ne0, ne1, n_seqs] (strided; ne0*ne1 == row_elems), so view sequence s out of it, keeping its strides
+    GGML_ASSERT(src->ne[0] * src->ne[1] == row_elems && src->ne[2] == n_seqs);
+    for (int64_t s = 0; s < n_seqs; ++s) {
+        ggml_tensor * srcs = ggml_view_2d(ctx0, src, src->ne[0], src->ne[1], src->nb[1], (size_t) s * src->nb[2]);
+        ggml_tensor * dsts = ggml_view_1d(ctx0, states_all, row_elems, ((size_t) inp->snap_row1[s] + slot - 1) * row_size);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, srcs, dsts));
+    }
 }
 
 ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
@@ -561,7 +581,7 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     }
 
     const int64_t D = S_v * S_v * H_v;
-    const int64_t K = cparams.n_rs_seq + 1;
+    const int64_t K = rs_n_slots(inp);
 
     // state s is 4D [S_v, S_v, H_v, n_seqs]; K snapshot slots are written into the output.
     ggml_tensor * gdn_out = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, K);
@@ -587,20 +607,46 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     // op writes the last min(n_seq_tokens, K) snapshots; trailing slots are left unwritten
     const int64_t n_written = std::min<int64_t>(n_seq_tokens, K);
 
-    // write the produced snapshots into the recurrent cache (snapshot slot i -> rollback group i)
-    ggml_tensor * src = ggml_view_3d(ctx0, gdn_out,
-        D, n_seqs, n_written,
-        ggml_row_size(gdn_out->type, D),
-        ggml_row_size(gdn_out->type, state_size_per_snap),
-        ggml_row_size(gdn_out->type, attn_score_elems));
+    if (inp->rs_pool == 0) {
+        // write the produced snapshots into the recurrent cache (snapshot slot i -> rollback group i)
+        ggml_tensor * src = ggml_view_3d(ctx0, gdn_out,
+            D, n_seqs, n_written,
+            ggml_row_size(gdn_out->type, D),
+            ggml_row_size(gdn_out->type, state_size_per_snap),
+            ggml_row_size(gdn_out->type, attn_score_elems));
 
-    ggml_tensor * dst = ggml_view_3d(ctx0, ssm_states_all,
-        D, n_seqs, n_written,
-        ssm_states_all->nb[1],
-        (size_t) mem_size * row_size,
-        (size_t) kv_head * row_size);
+        ggml_tensor * dst = ggml_view_3d(ctx0, ssm_states_all,
+            D, n_seqs, n_written,
+            ssm_states_all->nb[1],
+            (size_t) mem_size * row_size,
+            (size_t) kv_head * row_size);
 
-    ggml_build_forward_expand(gf, ggml_cpy(ctx0, src, dst));
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, src, dst));
+
+        return output;
+    }
+
+    // [TAG_RS_POOL] slot 0 to the live rows, then slots 1 .. n_written - 1 (the tail, slot-major) to the pool rows the input
+    // table names, in one set_rows (the CUDA backend fuses both into the gated_delta_net launch, ggml_cuda_try_gdn_cache_fusion)
+    GGML_ASSERT(D == hparams.n_embd_s());
+    {
+        ggml_tensor * src0 = ggml_view_3d(ctx0, gdn_out, D, n_seqs, 1,
+            ggml_row_size(gdn_out->type, D), ggml_row_size(gdn_out->type, state_size_per_snap), ggml_row_size(gdn_out->type, attn_score_elems));
+        ggml_tensor * dst0 = ggml_view_3d(ctx0, ssm_states_all, D, n_seqs, 1,
+            ssm_states_all->nb[1], (size_t) mem_size * row_size, (size_t) kv_head * row_size);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, src0, dst0));
+    }
+    if (n_written > 1) {
+        GGML_ASSERT((int64_t) inp->n_snap >= n_written && (int64_t) inp->snap_row1.size() >= n_seqs);
+        for (int64_t s = 0; s < n_seqs; ++s) {
+            // sequence s's slots 1 .. n_written - 1: in the tail at the slot stride, in the cache as consecutive rows from its slot-1 row
+            ggml_tensor * src1 = ggml_view_2d(ctx0, gdn_out, D, n_written - 1, ggml_row_size(gdn_out->type, state_size_per_snap),
+                ggml_row_size(gdn_out->type, attn_score_elems + state_size_per_snap + s * D));
+            ggml_tensor * dst1 = ggml_view_2d(ctx0, ssm_states_all, D, n_written - 1, ssm_states_all->nb[1],
+                (size_t) inp->snap_row1[s] * row_size);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, src1, dst1));
+        }
+    }
 
     return output;
 }
