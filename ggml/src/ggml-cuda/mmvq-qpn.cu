@@ -60,6 +60,76 @@
 
 #include "mmvq-qpn-impl.cuh"
 
+#include <mutex>
+#include <string>
+
+// LLAMA_QPN_BENCH=N: the first direct (uncaptured) launch of each distinct key is repeated N times back to back and timed
+static int qpn_bench_reps() {
+    static const int n = [] { const char * e = getenv("LLAMA_QPN_BENCH"); return e == nullptr ? 0 : atoi(e); }();
+    return n;
+}
+
+// LLAMA_QPN_LOG=1: each distinct launch (kind, tokens, grid, block, mode, and each weight's type, rows x columns, bytes) once on
+// stderr, to match a profile's kernels to the products they read. Returns the launch's key (empty unless the log or the bench is on)
+static std::string qpn_log_launch(const char * kind, std::initializer_list<const ggml_tensor *> w, const int T, const dim3 grid, const dim3 block,
+        const int mode, const int stage) {
+    static const bool on = [] { const char * e = getenv("LLAMA_QPN_LOG"); return e != nullptr && atoi(e) != 0; }();
+    if (!on && qpn_bench_reps() <= 0) {
+        return {};
+    }
+    char buf[512];
+    int  n = snprintf(buf, sizeof(buf), "%s T=%d grid=%ux%u block=%ux%u mode=%d stage=%d", kind, T, grid.x, grid.y, block.x, block.y, mode, stage);
+    for (const ggml_tensor * t : w) {
+        n += snprintf(buf + n, sizeof(buf) - n, " %s:%lldx%lld:%zu", ggml_type_name(t->type), (long long) t->ne[1], (long long) t->ne[0], ggml_nbytes(t));
+    }
+    static std::mutex                      mu;
+    static std::unordered_set<std::string> seen;
+    std::lock_guard<std::mutex> lock(mu);
+    if (on && seen.insert(buf).second) {
+        fprintf(stderr, "qpn-launch %s\n", buf);
+    }
+    return buf;
+}
+
+// LLAMA_QPN_BENCH: times launch() repeated back to back, once per key, outside a capture (the weights are read cold: each
+// routed tensor but the small k/v is larger than the L2)
+template <typename F>
+static void qpn_bench(const std::string & key, const size_t bytes, cudaStream_t stream, F && launch) {
+    const int reps = qpn_bench_reps();
+    if (reps <= 0 || key.empty()) {
+        return;
+    }
+    cudaStreamCaptureStatus cs;
+    CUDA_CHECK(cudaStreamIsCapturing(stream, &cs));
+    if (cs != cudaStreamCaptureStatusNone) {
+        return;
+    }
+    static std::mutex                      mu;
+    static std::unordered_set<std::string> seen;
+    {
+        std::lock_guard<std::mutex> lock(mu);
+        if (!seen.insert(key).second) {
+            return;
+        }
+    }
+    cudaEvent_t e0, e1;
+    CUDA_CHECK(cudaEventCreate(&e0));
+    CUDA_CHECK(cudaEventCreate(&e1));
+    launch(); // warm the launch path
+    CUDA_CHECK(cudaEventRecord(e0, stream));
+    for (int i = 0; i < reps; ++i) {
+        launch();
+    }
+    CUDA_CHECK(cudaEventRecord(e1, stream));
+    CUDA_CHECK(cudaEventSynchronize(e1));
+    float ms = 0.0f;
+    CUDA_CHECK(cudaEventElapsedTime(&ms, e0, e1));
+    const double us = 1e3*ms/reps;
+    fprintf(stderr, "qpn-bench %s : %.1f us %.0f GB/s\n", key.c_str(), us, bytes/us/1e3);
+    CUDA_CHECK(cudaEventDestroy(e0));
+    CUDA_CHECK(cudaEventDestroy(e1));
+}
+
 // One warp per (256-column slice, token); the arithmetic and the layout are qpn-prep.cuh's.
 static __global__ void qpn_prep_kernel(const float * __restrict__ x, const int64_t stride_col_x, const int nsb, const int T,
         half * __restrict__ xh, half * __restrict__ xs, float * __restrict__ xsc) {
@@ -483,6 +553,27 @@ static qpn_cfg ggml_cuda_qpn_config(const ggml_type type, const int64_t n, const
         c = *sc;
     } else if (n >= 65536) {
         c = { 1, 4, 1, 0 };
+    }
+    // [TAG_QPN_SMALL] LLAMA_QPN_SMALL_CFG (default off; 1 = { 8, 1, 4, 0 }, or "S,R,P,stage"): at 1 to 4 tokens, the products of at
+    // most 1,280 rows (attention k/v, the GDN alpha/beta, the draft's conv projections) split along K too. As their own row tiles
+    // alone (2 to 40 blocks) they run latency-bound: alone on this card, the 96-row ab 16.5 -> 8.6 us, the 1024-row k/v 23-27 -> 11-15.
+    // A new summation order; in a 1-slot decode at ~41% acceptance a verify step went 39.8 -> 39.4 ms, but the greedy path moved
+    // (1219/2960 -> 1201/3016 accepted) and the run was no faster, so it stays off
+    if (T <= 4 && n <= 1280) {
+        static const qpn_cfg small = [] {
+            qpn_cfg s = { 0, 1, 1, 0 };
+            if (const char * e = getenv("LLAMA_QPN_SMALL_CFG")) {
+                if (strchr(e, ',') != nullptr) {
+                    sscanf(e, "%d,%d,%d,%d", &s.S, &s.R, &s.P, &s.stage);
+                } else if (atoi(e) != 0) {
+                    s = { 8, 1, 4, 0 };
+                }
+            }
+            return s;
+        }();
+        if (small.S > 0) {
+            c = small;
+        }
     }
     const char * ecfg = getenv("LLAMA_MMVQ_QPN_CFG");
     if (ecfg) { // "S,R,P,stage[,mode]", for the sweep
@@ -1109,6 +1200,7 @@ void ggml_cuda_mul_mat_qpn(ggml_backend_cuda_context & ctx, const ggml_tensor * 
         c.P = std::max(1, std::min(c.P, nsb));
         const dim3 grid(nh*((ntiles + c.R - 1)/c.R), c.P), block(WARP_SIZE, c.S*c.R);
         const size_t smem = c.stage ? ggml_cuda_qpn_stage_bytes(nsb, c.P, T) : 0;
+        const std::string key = qpn_log_launch("mul", { src0 }, T, grid, block, c.mode, c.stage);
         const int NL = T > 16 ? 32 : T > 8 ? 16 : T > 4 ? 8 : 4;
 
         size_t sz_xh, sz_xs, sz_xsc;
@@ -1156,16 +1248,21 @@ void ggml_cuda_mul_mat_qpn(ggml_backend_cuda_context & ctx, const ggml_tensor * 
             CUDA_CHECK(cudaMemsetAsync(a.xsc, 0, sz_xsc, stream));
         }
 
-        bool pushed = false;
-        switch (src0->type) {
-            case GGML_TYPE_Q4_K: pushed = ggml_cuda_qpn_launch<GGML_TYPE_Q4_K>(T, c.stage, c.mode, grid, block, smem, stream, a); break;
-            case GGML_TYPE_Q5_K: pushed = ggml_cuda_qpn_launch<GGML_TYPE_Q5_K>(T, c.stage, c.mode, grid, block, smem, stream, a); break;
-            case GGML_TYPE_Q6_K: pushed = ggml_cuda_qpn_launch<GGML_TYPE_Q6_K>(T, c.stage, c.mode, grid, block, smem, stream, a); break;
-            case GGML_TYPE_IQ4_XS: pushed = ggml_cuda_qpn_launch<GGML_TYPE_IQ4_XS>(T, c.stage, c.mode, grid, block, smem, stream, a); break;
-            case GGML_TYPE_IQ4_NL: pushed = ggml_cuda_qpn_launch<GGML_TYPE_IQ4_NL>(T, c.stage, c.mode, grid, block, smem, stream, a); break;
-            case GGML_TYPE_Q3_K:   pushed = ggml_cuda_qpn_launch<GGML_TYPE_Q3_K>(T, c.stage, c.mode, grid, block, smem, stream, a); break;
-            case GGML_TYPE_Q8_0:   pushed = ggml_cuda_qpn_launch<GGML_TYPE_Q8_0>(T, c.stage, c.mode, grid, block, smem, stream, a); break;
-            default: GGML_ABORT("fatal error");
+        auto launch = [&]() {
+            switch (src0->type) {
+                case GGML_TYPE_Q4_K: return ggml_cuda_qpn_launch<GGML_TYPE_Q4_K>(T, c.stage, c.mode, grid, block, smem, stream, a);
+                case GGML_TYPE_Q5_K: return ggml_cuda_qpn_launch<GGML_TYPE_Q5_K>(T, c.stage, c.mode, grid, block, smem, stream, a);
+                case GGML_TYPE_Q6_K: return ggml_cuda_qpn_launch<GGML_TYPE_Q6_K>(T, c.stage, c.mode, grid, block, smem, stream, a);
+                case GGML_TYPE_IQ4_XS: return ggml_cuda_qpn_launch<GGML_TYPE_IQ4_XS>(T, c.stage, c.mode, grid, block, smem, stream, a);
+                case GGML_TYPE_IQ4_NL: return ggml_cuda_qpn_launch<GGML_TYPE_IQ4_NL>(T, c.stage, c.mode, grid, block, smem, stream, a);
+                case GGML_TYPE_Q3_K:   return ggml_cuda_qpn_launch<GGML_TYPE_Q3_K>(T, c.stage, c.mode, grid, block, smem, stream, a);
+                case GGML_TYPE_Q8_0:   return ggml_cuda_qpn_launch<GGML_TYPE_Q8_0>(T, c.stage, c.mode, grid, block, smem, stream, a);
+                default: GGML_ABORT("fatal error");
+            }
+        };
+        const bool pushed = launch();
+        if (!pushing) {
+            qpn_bench(key, ggml_nbytes(src0), stream, launch);
         }
         if (pushed) {
             ctx.p2p_pushed = ctx.p2p_push_ar;
@@ -1291,6 +1388,7 @@ void ggml_cuda_mul_mat_qpn2(ggml_backend_cuda_context & ctx, const ggml_tensor *
     const int nb0 = (nt0 + R - 1)/R, nb1 = (nt1 + R - 1)/R;
     const dim3 grid(nb0 + nb1, 1), block(WARP_SIZE, S*R);
     const size_t smem = T <= 4 && stage ? ggml_cuda_qpn_stage_bytes(nsb, 1, T) : 0;
+    const std::string key = qpn_log_launch("mul2", { w0, w1 }, T, grid, block, stage, -1);
 
     size_t sz_xh, sz_xs, sz_xsc;
     ggml_cuda_qpn_prep_sizes(K, T, sz_xh, sz_xs, sz_xsc);
@@ -1314,16 +1412,20 @@ void ggml_cuda_mul_mat_qpn2(ggml_backend_cuda_context & ctx, const ggml_tensor *
     const qpn_seg g0 = { (const char *) w0->data, nt0, (float *) d0->data, (int64_t) (d0->nb[1]/sizeof(float)) };
     const qpn_seg g1 = { (const char *) w1->data, nt1, (float *) d1->data, (int64_t) (d1->nb[1]/sizeof(float)) };
     const half * xsp = mins ? xs : nullptr;
-    switch (w0->type) {
-        case GGML_TYPE_Q4_K:   ggml_cuda_qpn2_launch_t<GGML_TYPE_Q4_K  >(w1->type, T, stage, grid, block, smem, stream, g0, g1, nb0, nsb, S, xh, xsp, xsc, x, sx); break;
-        case GGML_TYPE_Q5_K:   ggml_cuda_qpn2_launch_t<GGML_TYPE_Q5_K  >(w1->type, T, stage, grid, block, smem, stream, g0, g1, nb0, nsb, S, xh, xsp, xsc, x, sx); break;
-        case GGML_TYPE_Q6_K:   ggml_cuda_qpn2_launch_t<GGML_TYPE_Q6_K  >(w1->type, T, stage, grid, block, smem, stream, g0, g1, nb0, nsb, S, xh, xsp, xsc, x, sx); break;
-        case GGML_TYPE_IQ4_XS: ggml_cuda_qpn2_launch_t<GGML_TYPE_IQ4_XS>(w1->type, T, stage, grid, block, smem, stream, g0, g1, nb0, nsb, S, xh, xsp, xsc, x, sx); break;
-        case GGML_TYPE_IQ4_NL: ggml_cuda_qpn2_launch_t<GGML_TYPE_IQ4_NL>(w1->type, T, stage, grid, block, smem, stream, g0, g1, nb0, nsb, S, xh, xsp, xsc, x, sx); break;
-        case GGML_TYPE_Q3_K:   ggml_cuda_qpn2_launch_t<GGML_TYPE_Q3_K  >(w1->type, T, stage, grid, block, smem, stream, g0, g1, nb0, nsb, S, xh, xsp, xsc, x, sx); break;
-        default: GGML_ABORT("fatal error");
-    }
+    auto launch = [&]() {
+        switch (w0->type) {
+            case GGML_TYPE_Q4_K:   ggml_cuda_qpn2_launch_t<GGML_TYPE_Q4_K  >(w1->type, T, stage, grid, block, smem, stream, g0, g1, nb0, nsb, S, xh, xsp, xsc, x, sx); break;
+            case GGML_TYPE_Q5_K:   ggml_cuda_qpn2_launch_t<GGML_TYPE_Q5_K  >(w1->type, T, stage, grid, block, smem, stream, g0, g1, nb0, nsb, S, xh, xsp, xsc, x, sx); break;
+            case GGML_TYPE_Q6_K:   ggml_cuda_qpn2_launch_t<GGML_TYPE_Q6_K  >(w1->type, T, stage, grid, block, smem, stream, g0, g1, nb0, nsb, S, xh, xsp, xsc, x, sx); break;
+            case GGML_TYPE_IQ4_XS: ggml_cuda_qpn2_launch_t<GGML_TYPE_IQ4_XS>(w1->type, T, stage, grid, block, smem, stream, g0, g1, nb0, nsb, S, xh, xsp, xsc, x, sx); break;
+            case GGML_TYPE_IQ4_NL: ggml_cuda_qpn2_launch_t<GGML_TYPE_IQ4_NL>(w1->type, T, stage, grid, block, smem, stream, g0, g1, nb0, nsb, S, xh, xsp, xsc, x, sx); break;
+            case GGML_TYPE_Q3_K:   ggml_cuda_qpn2_launch_t<GGML_TYPE_Q3_K  >(w1->type, T, stage, grid, block, smem, stream, g0, g1, nb0, nsb, S, xh, xsp, xsc, x, sx); break;
+            default: GGML_ABORT("fatal error");
+        }
+    };
+    launch();
     CUDA_CHECK(cudaGetLastError());
+    qpn_bench(key, ggml_nbytes(w0) + ggml_nbytes(w1), stream, launch);
 }
 
 // ------------------------------------------------------------------------------------------------------------------
@@ -1524,6 +1626,7 @@ void ggml_cuda_mul_mat_qpn3(ggml_backend_cuda_context & ctx, const ggml_tensor *
     const int nt[3] = { (int) (w[0]->ne[1]/32), (int) (w[1]->ne[1]/32), (int) (w[2]->ne[1]/32) };
     const int nb[3] = { (nt[0] + R - 1)/R, (nt[1] + R12 - 1)/R12, (nt[2] + R12 - 1)/R12 };
     const dim3 grid(nb[0] + nb[1] + nb[2], 1), block(WARP_SIZE, S*R);
+    qpn_log_launch("mul3", { w[0], w[1], w[2] }, T, grid, block, -1, -1);
 
     size_t sz_xh, sz_xs, sz_xsc;
     ggml_cuda_qpn_prep_sizes(K, T, sz_xh, sz_xs, sz_xsc);
@@ -1582,6 +1685,7 @@ static void ggml_cuda_mul_mat_qpn2ab(ggml_backend_cuda_context & ctx, const ggml
     const int nt0 = (int) (w0->ne[1]/32), nt1 = (int) (w1->ne[1]/32), ntab = (int) (wab->ne[1]/32);
     const int nb0 = (nt0 + R - 1)/R, nb1 = (nt1 + R - 1)/R, nbab = (ntab + R - 1)/R;
     const dim3 grid(nbab + nb0 + nb1, 1), block(WARP_SIZE, S*R);
+    qpn_log_launch("mul2ab", { w0, w1, wab }, T, grid, block, stage, -1);
 
     size_t sz_xh, sz_xs, sz_xsc;
     ggml_cuda_qpn_prep_sizes(K, T, sz_xh, sz_xs, sz_xsc);
@@ -1641,6 +1745,7 @@ void ggml_cuda_mul_mat_qpn4ab(ggml_backend_cuda_context & ctx, const ggml_tensor
     const int nt0 = (int) (w0->ne[1]/32), nt1 = (int) (w1->ne[1]/32);
     const int nb0 = (nt0 + R - 1)/R, nb1 = (nt1 + R - 1)/R, nbm = (1 + R - 1)/R; // nbm: a one-tile member's blocks
     const dim3 grid(2*nbm + nb0 + nb1, 1), block(WARP_SIZE, S*R);
+    qpn_log_launch("mul4ab", { w0, w1 }, T, grid, block, stage, -1);
 
     size_t sz_xh, sz_xs, sz_xsc;
     ggml_cuda_qpn_prep_sizes(K, T, sz_xh, sz_xs, sz_xsc);
