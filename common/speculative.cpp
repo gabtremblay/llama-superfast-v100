@@ -19,6 +19,7 @@
 #include <climits>
 #include <cmath>
 #include <cstring>
+#include <functional>
 #include <iomanip>
 #include <map>
 #include <cinttypes>
@@ -1496,39 +1497,54 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     void draft(common_speculative_draft_params_vec & dparams) override {
         auto & ctx_dft = params.ctx_dft;
 
-        common_batch_clear(batch);
-
-        // build one batch holding every drafting sequence's noise block into a single decode)
-        // record where each block starts and its size
+        // every drafting sequence's noise block goes into one decode, and the graph reads the batch as equal blocks
+        // (n_tokens / n_seqs_unq each: the conv and the selector). [TAG_SPEC_DRAFT_WIDTHS] A narrowed round
+        // ([TAG_SPEC_ADAPT_WIDTH]) drafts a shorter block, so the sequences are decoded one block width at a time: with
+        // two widths in one batch, two sequences (4 + 8 tokens, 12 % 2 == 0) silently read as two blocks of 6 that mixed
+        // the sequences, and three (4 + 8 + 8) hit the graph's assert. Each decode's results are read before the next
         std::vector<int32_t> i_block_beg(n_seq, -1);
         std::vector<int32_t> n_block    (n_seq,  0);
+        std::vector<int32_t> widths;
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             auto & dp = dparams[seq_id];
             if (!dp.drafting) {
                 continue;
             }
+            // [TAG_SPEC_ADAPT_WIDTH] a narrowed round drafts a block of that width, as a launch at that n-max does
+            const int32_t n_draft = dp.n_cap > 0 ? std::min(params.n_max, dp.n_cap) : params.n_max;
+
+            n_block[seq_id] = n_draft + (is_dspark && sample_from_anchor ? 0 : 1);
+            if (std::find(widths.begin(), widths.end(), n_block[seq_id]) == widths.end()) {
+                widths.push_back(n_block[seq_id]);
+            }
+        }
+        std::sort(widths.begin(), widths.end(), std::greater<int32_t>()); // the full width first (the common round)
+
+        for (const int32_t width : widths) {
+        common_batch_clear(batch);
+
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            auto & dp = dparams[seq_id];
+            if (!dp.drafting || n_block[seq_id] != width) {
+                continue;
+            }
 
             common_sampler_reset(smpls[seq_id].get());
 
             const int32_t n = (int32_t) dp.pos0;
-
-            // [TAG_SPEC_ADAPT_WIDTH] a narrowed round drafts a block of that width, as a launch at that n-max does
-            const int32_t n_draft = dp.n_cap > 0 ? std::min(params.n_max, dp.n_cap) : params.n_max;
-
-            const int32_t n_block_tokens = n_draft + (is_dspark && sample_from_anchor ? 0 : 1);
+            const int32_t n_block_tokens = n_block[seq_id];
             i_block_beg[seq_id] = batch.n_tokens;
-            n_block    [seq_id] = n_block_tokens;
             for (int32_t i = 0; i < n_block_tokens; ++i) {
                 common_batch_add(batch, i == 0 ? dp.id_last : mask_token_id, n + i, { seq_id }, !is_dflash2);
             }
         }
 
         if (batch.n_tokens == 0) {
-            return;
+            continue;
         }
 
-        // decode all sequence's noise block in a single batch
+        // decode this width's noise blocks in a single batch
         int ret = llama_decode(ctx_dft, batch);
         if (ret != 0) {
             LOG_WRN("%s: llama_decode returned %d\n", __func__, ret);
@@ -1536,7 +1552,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-            if (i_block_beg[seq_id] < 0) {
+            if (i_block_beg[seq_id] < 0 || n_block[seq_id] != width) {
                 continue;
             }
             auto & dp = dparams[seq_id];
@@ -1706,6 +1722,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 result.clear();
             }
         }
+        } // widths
     }
 
     void accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/, bool /*is_other*/) override {

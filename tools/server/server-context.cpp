@@ -5223,7 +5223,16 @@ private:
 
                         // [TAG_SPEC_ADAPT_WIDTH] the narrow width, or no cap
                         const int32_t ada_full = common_speculative_n_max(spec.get());
-                        const int32_t ada_w    = slot.ada_width(ada_full, slot.prompt.n_tokens());
+                        int32_t       ada_w    = slot.ada_width(ada_full, slot.prompt.n_tokens());
+                        // [TAG_SPEC_WIDTH_SLOTS] the generating slots' verify rows together stay within one 16-token pass of the
+                        // tensor-core products: 17 to 32 rows run the 32-token kernel at one block per SM (Q6_K ffn down 117 us at
+                        // 16 rows, 158 at 24), and three slots at n-max 7 (24 rows) decoded no faster together than two. So each
+                        // slot drafts at most 16 / n_generating - 1 tokens: 7 at one or two slots, 4 at three, 3 at four (three
+                        // slots: 93 -> 121 tok/s together). LLAMA_SPEC_WIDTH_SLOTS sets the budget in rows (default 16; 0 = off)
+                        static const int32_t width_rows = [] { const char * e = getenv("LLAMA_SPEC_WIDTH_SLOTS"); return e ? atoi(e) : 16; }();
+                        if (width_rows > 0 && !generating.empty()) {
+                            ada_w = std::max<int32_t>(1, std::min<int32_t>(ada_w, width_rows / (int32_t) generating.size() - 1));
+                        }
                         const int32_t ada_cap  = ada_w < ada_full ? ada_w : 0;
 
                         common_speculative_get_draft_params(spec.get(), slot.id) = {
