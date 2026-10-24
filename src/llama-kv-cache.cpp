@@ -1189,28 +1189,21 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
                     continue;
                 }
             }
-            // else the start of the largest run of free cells, if it holds the whole ubatch: the conversation's decode follows its
-            // prompt there. The head search fills holes token by token, so a new conversation's first 42 tokens went 36 into a hole
-            // at the bottom and 6 past the other slot's 47k cells; and a first fit put a 21-token prompt into a 36-cell hole that its
-            // decode outgrew within a few rounds. Either way every later window spanned the other slot's cells
-            uint32_t best = 0, best_len = 0, run = 0;
-            for (uint32_t j = 0; j <= cells.size(); ++j) {
-                if (j < cells.size() && cells.is_empty(j)) {
-                    ++run;
-                    continue;
-                }
-                if (run > best_len) {
-                    best_len = run;
-                    best     = j - run;
-                }
-                run = 0;
-            }
-            if (best_len >= n_tokens) {
+            // else a run of free cells that holds the whole ubatch: the conversation's decode follows its prompt there. The head
+            // search fills holes token by token, so a new conversation's first 42 tokens went 36 into a hole at the bottom and 6
+            // past the other slot's 47k cells; and a first fit put a 21-token prompt into a 36-cell hole that its decode outgrew
+            // within a few rounds. Either way every later window spanned the other slot's cells. [TAG_KV_PLACE_LOW] the run is the
+            // lowest one that holds the whole prompt the server announced (seq_place_hint) with room to grow, else the largest:
+            // the largest run alone sent every new conversation to the top of an emptying pool, and the four slots' decodes
+            // then read the whole used range (BetterBench's concurrency after its prefill sweep: 132 -> 118 tok/s)
+            const uint32_t need = std::max(n_tokens, (size_t) sq < place_hint.size() ? place_hint[sq] : 0u);
+            const int64_t  best = free_run_for(cells, need);
+            if (best >= 0) {
                 for (uint32_t k = 0; k < n_tokens; ++k) {
-                    res.idxs[s].push_back(best + k);
+                    res.idxs[s].push_back((uint32_t) best + k);
                 }
                 if (plog) {
-                    fprintf(stderr, "kv place largest-run: seq %d, %u tokens, cells %u..%u (run of %u)\n", sq, n_tokens, best, best + n_tokens - 1, best_len);
+                    fprintf(stderr, "kv place run: seq %d, %u tokens (need %u), cells %lld..%lld\n", sq, n_tokens, need, (long long) best, (long long) best + n_tokens - 1);
                 }
                 continue;
             }
@@ -1468,6 +1461,48 @@ const llama_kv_cells & llama_kv_cache::get_cells(llama_seq_id seq_id) const {
     return v_cells[seq_to_stream[seq_id]];
 }
 
+// [TAG_KV_PLACE_LOW]
+int64_t llama_kv_cache::free_run_for(const llama_kv_cells & cells, uint32_t need) const {
+    static const uint32_t margin = [] {
+        const char * e = getenv("LLAMA_KV_PLACE_MARGIN");
+        return e ? (uint32_t) std::max(0, atoi(e)) : 16384u;
+    }();
+    int64_t  low = -1;          // the lowest run of need + margin cells
+    int64_t  big = -1;          // the largest run
+    uint32_t big_len = 0;
+    uint32_t run = 0;
+    for (uint32_t j = 0; j <= cells.size(); ++j) {
+        if (j < cells.size() && cells.is_empty(j)) {
+            ++run;
+            continue;
+        }
+        if (run > 0) {
+            if (low < 0 && (uint64_t) run >= (uint64_t) need + margin) {
+                low = j - run;
+            }
+            if (run > big_len) {
+                big_len = run;
+                big     = j - run;
+            }
+        }
+        run = 0;
+    }
+    if (low >= 0) {
+        return low;
+    }
+    return big_len >= need ? big : -1;
+}
+
+void llama_kv_cache::seq_place_hint(llama_seq_id seq_id, uint32_t n_tokens) {
+    if (seq_id < 0) {
+        return;
+    }
+    if ((size_t) seq_id >= place_hint.size()) {
+        place_hint.resize(seq_id + 1, 0);
+    }
+    place_hint[seq_id] = n_tokens;
+}
+
 // [TAG_KV_EVICT_IDLE]
 uint32_t llama_kv_cache::seq_room(llama_seq_id seq_id) const {
     if (!kv_window || n_stream != 1 || seq_id < 0) {
@@ -1546,22 +1581,12 @@ bool llama_kv_cache::seq_compact(llama_seq_id seq_id, uint32_t n_next, const std
         }
     }
 
-    // the largest free run, if it holds the cells and the ubatch
-    uint32_t best = 0, best_len = 0, run = 0;
-    for (uint32_t j = 0; j <= cells.size(); ++j) {
-        if (j < cells.size() && cells.is_empty(j)) {
-            ++run;
-            continue;
-        }
-        if (run > best_len) {
-            best_len = run;
-            best     = j - run;
-        }
-        run = 0;
-    }
-    if (best_len < idx.size() + n_next) {
+    // a free run that holds the cells and the ubatch ([TAG_KV_PLACE_LOW]: the lowest with room to grow, else the largest)
+    const int64_t best_run = free_run_for(cells, (uint32_t) idx.size() + n_next);
+    if (best_run < 0) {
         return false;
     }
+    const uint32_t best = (uint32_t) best_run;
 
     std::sort(idx.begin(), idx.end(), [&](uint32_t a, uint32_t b) { return cells.pos_get(a) < cells.pos_get(b); });
 
@@ -1598,8 +1623,8 @@ bool llama_kv_cache::seq_compact(llama_seq_id seq_id, uint32_t n_next, const std
 
     static const bool wlog = getenv("LLAMA_KV_WINDOW_LOG") != nullptr;
     if (wlog) {
-        fprintf(stderr, "kv compact: seq %d, %zu cells moved to %u..%u (run of %u) before a ubatch of %u tokens\n", seq_id, idx.size(),
-                best, best + (uint32_t) idx.size() - 1, best_len, n_next);
+        fprintf(stderr, "kv compact: seq %d, %zu cells moved to %u..%u before a ubatch of %u tokens\n", seq_id, idx.size(),
+                best, best + (uint32_t) idx.size() - 1, n_next);
     }
     return true;
 }

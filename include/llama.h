@@ -839,6 +839,9 @@ extern "C" {
     // [TAG_KV_COMPACT] move seq_id's cells (at most LLAMA_KV_COMPACT_MAX of them) to the start of the largest free run when that
     // run holds them and n_next more tokens and they cannot grow in place; true when they moved
     LLAMA_API bool     llama_kv_compact_seq(struct llama_context * ctx, llama_seq_id seq_id, uint32_t n_next);
+    // [TAG_KV_PLACE_LOW] the tokens seq_id's prompt is about to add: a unified cache places it in the lowest free run that holds
+    // them with room to grow, the largest only when none does
+    LLAMA_API void     llama_kv_place_hint(struct llama_context * ctx, llama_seq_id seq_id, uint32_t n_tokens);
 
     // Copy all tokens that belong to the specified sequence to another sequence
     // p0 < 0 : [0,  p1]

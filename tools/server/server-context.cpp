@@ -5901,6 +5901,7 @@ private:
                     static const bool kv_evict_idle = [] { const char * e = getenv("LLAMA_KV_EVICT_IDLE"); return e ? atoi(e) != 0 : true; }();
                     if (params_base.kv_unified) {
                         const int32_t n_add = slot.task->n_tokens() - slot.prompt.n_tokens();
+                        llama_kv_place_hint(ctx_tgt, slot.id, n_add > 0 ? (uint32_t) n_add : 0u); // [TAG_KV_PLACE_LOW]
                         uint32_t room = llama_kv_room(ctx_tgt, slot.id);
                         if (n_add > 0 && (uint64_t) n_add > room && llama_kv_compact_seq(ctx_tgt, slot.id, (uint32_t) n_add)) {
                             room = llama_kv_room(ctx_tgt, slot.id);

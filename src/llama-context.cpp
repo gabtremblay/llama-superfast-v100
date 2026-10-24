@@ -2735,6 +2735,21 @@ bool llama_context::job_supported() const {
     return true;
 }
 
+void llama_context::kv_place_hint(llama_seq_id seq_id, uint32_t n_tokens) {
+    if (!cparams.kv_unified) {
+        return;
+    }
+    llama_kv_cache * kv = nullptr;
+    if (auto * h = dynamic_cast<llama_memory_hybrid *>(memory.get())) {
+        kv = h->get_mem_attn();
+    } else {
+        kv = dynamic_cast<llama_kv_cache *>(memory.get());
+    }
+    if (kv != nullptr) {
+        kv->seq_place_hint(seq_id, n_tokens);
+    }
+}
+
 bool llama_context::kv_compact_seq(llama_seq_id seq_id, uint32_t n_next) {
     if (!cparams.kv_unified || n_next == 0) {
         return false;
@@ -6268,6 +6283,10 @@ uint32_t llama_kv_room(llama_context * ctx, llama_seq_id seq_id) {
 
 bool llama_kv_compact_seq(llama_context * ctx, llama_seq_id seq_id, uint32_t n_next) {
     return ctx->kv_compact_seq(seq_id, n_next);
+}
+
+void llama_kv_place_hint(llama_context * ctx, llama_seq_id seq_id, uint32_t n_tokens) {
+    ctx->kv_place_hint(seq_id, n_tokens);
 }
 
 void llama_rs_set_depths(llama_context * ctx, const uint32_t * depths, size_t n) {

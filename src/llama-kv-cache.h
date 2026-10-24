@@ -186,9 +186,18 @@ public:
     // max_cells overrides LLAMA_KV_COMPACT_MAX for this call (a prompt's start moves its whole cached prefix: a copy of a few ms once)
     bool seq_compact(llama_seq_id seq_id, uint32_t n_next, const std::function<void()> & sync, uint32_t max_cells = 0);
 
+    // the start of the free run for need cells: the lowest run of need + margin cells, else the largest of at least need; -1 when none
+    int64_t free_run_for(const llama_kv_cells & cells, uint32_t need) const;
+    std::vector<uint32_t> place_hint; // [TAG_KV_PLACE_LOW] per sequence
+
     // [TAG_KV_EVICT_IDLE] the cells a sequence can take while staying one run: the free cells right after its last cell, or
     // the largest free run when it has none (the placement of find_slot). The cache size when the window placement is off
     uint32_t seq_room(llama_seq_id seq_id) const;
+
+    // [TAG_KV_PLACE_LOW] the tokens a sequence's prompt is about to add: find_slot and seq_compact then pick the lowest free run
+    // that holds them with room to grow (LLAMA_KV_PLACE_MARGIN cells, default 16384), the largest run only when none does,
+    // so conversations stack from the bottom of the pool and the cells a decode reads (the used range) stay low
+    void seq_place_hint(llama_seq_id seq_id, uint32_t n_tokens);
 
     // turn on the change journal of every cells array (llama_kv_cells::jrnl_enable)
     void cells_jrnl_enable();
