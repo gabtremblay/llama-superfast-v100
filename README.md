@@ -1,19 +1,23 @@
 # llama-superfast-v100-q8-inscora
 
 A fork of [bitexploder/llama-superfast-v100](https://github.com/bitexploder/llama-superfast-v100), the llama.cpp fork
-tuned for the Tesla V100 (Volta, `sm_70`), created for **one V100 card**, a **single user**, and **two concurrent slots** on a
-**unified KV cache**, to make agentic work palatable while maximizing context size. It adds:
+tuned for the Tesla V100 (Volta, `sm_70`), created for **one V100 card**, a **single user**, and **up to four concurrent
+slots** on a **unified KV cache**, to make agentic work palatable while maximizing context size. It adds:
 
 - an 8-bit (`q8_0`) KV cache on upstream's fast Volta attention kernels, which with the memory changes below nearly
   doubles the context one 32 GB card holds, for a few percent of decode speed;
-- a unified KV cache (`--kv-unified`) that runs at the split cache's speed, so two slots share one 245,760-token pool;
+- a unified KV cache (`--kv-unified`) that runs at the split cache's speed, so the slots share one 245,760-token pool, and
+  a prompt's cells kept one run of that pool, so its attention reads only its own cells;
+- four slots in the recurrent memory of two: the rollback snapshots of the draft are one pool the slots share, so a slot
+  alone keeps the full draft depth and four slots fit the same 245,760 tokens (aggregate decode 154 tok/s with four
+  requests in flight, against 91 with two slots);
 - upstream's two-user scheduler working with the DFlash2 draft on that unified cache, so a side request's prompt is read
   while the other slot keeps generating instead of waiting for it to finish;
 - faster prefill on upstream's repacked weights, and a faster first token on short prompts;
 - prompt work (DFlash2 features, checkpoints, masks) that stays on the GPU instead of crossing the host link;
 - a smaller CUDA graph cache, which freed ~1.2 GB of VRAM that only grew under real traffic.
 
-The model is Qwen3.8-27B (`UD-Q4_K_XL`) with the DFlash2 draft on a V100 PCIe 32 GB. The two slots serve one user: the
+The model is Qwen3.8-27B (`UD-Q4_K_XL`) with the DFlash2 draft on a V100 PCIe 32 GB. The slots serve one user: the
 main thinking thread, and the side requests an agent harness sends in parallel with it. Our card sits behind a PCIe Gen3 x4
 eGPU link (~3.3 GB/s), so anything that crosses the host link is on the critical path; the gains from keeping work on
 the GPU are largest on a link like that.
@@ -26,7 +30,7 @@ insurance services to your clients, have a look at [inscora.com](https://inscora
 
 ## Results
 
-One V100 PCIe 32 GB, Qwen3.8-27B `UD-Q4_K_XL`, DFlash2 draft, two slots, `--cache-ram 0`, the same probes for both.
+One V100 PCIe 32 GB, Qwen3.8-27B `UD-Q4_K_XL`, DFlash2 draft, `--cache-ram 0`, the same probes for both.
 Upstream is [bitexploder/llama-superfast-v100](https://github.com/bitexploder/llama-superfast-v100) at `403f06f` with its
 f16 KV cache and its recipe (`-b 4096 -ub 2048`), at the largest two-slot context it fits with the DFlash2 draft. This
 fork runs the [Run](#run) line below.
@@ -37,7 +41,7 @@ fork runs the [Run](#run) line below.
 | Cold prefill, ~48k-token prompt | 797 tok/s | 831 tok/s |
 | Time to first token, new ~125-token chat turn (median) | 657 ms | 260 ms |
 | Decode, 400 tokens, three prompts | 95 / 93 / 99 tok/s | 91 / 90 / 115 tok/s |
-| Context | 2 concurrent slots of 65,536 each | 2 concurrent slots sharing one 245,760-token pool (`--kv-unified`) |
+| Context | 2 concurrent slots of 65,536 each | 4 concurrent slots sharing one 245,760-token pool (`--kv-unified`) |
 
 Decode on the first two prompts is 3–4% slower, the cost of reading an 8-bit cache, in exchange for 1.9× the context;
 the third prompt's rate moves with how many draft tokens it accepts (the probe decodes greedily).
@@ -45,7 +49,25 @@ the third prompt's rate moves with how many draft tokens it accepts (the probe d
 Upstream's two-user scheduler refuses DFlash2 prompt jobs, so there a side request's prompt waits until the other slot
 finishes generating. Here it starts at once and the generating slot keeps ~34 tok/s while it is read (section 8).
 
-The 245,760-token pool peaks at 32,128 MiB of the card's 32,494 over a long run of mixed agentic traffic.
+The same comparison under [BetterBench](https://github.com/bitexploder/betterbench) (20 passes per category, a 47k-token
+conversation resident in one slot, the same corpus and sampling for both). Upstream runs with its scheduler off
+(`LLAMA_TU=0`: on, its prompt jobs refuse the DFlash2 draft and long prompts fail) at 2 × 49,152 tokens, the largest
+two-slot context that survived the run: at its 2 × 65,536 the card ran out of memory four minutes in, as its graph
+cache grew under traffic (section 5). This fork runs the [Run](#run) line: four slots, one 245,760-token pool.
+
+| BetterBench | Upstream, f16 KV, 2 × 49,152 | This fork, `q8_0` KV, 4 slots on 245,760 |
+|---|---|---|
+| Single-stream decode (weighted median) | 108.9 tok/s | 104.5 tok/s |
+| Time to first token, single stream (p50) | 610 ms | 190 ms |
+| Cold prefill, 12k / 24k / 47k-token prompts | 877 / 858 / 795 tok/s | 961 / 915 / 830 tok/s |
+| Aggregate decode, 1 / 2 / 4 / 8 requests in flight | 90 / 101 / 89 / 88 tok/s | 92 / 99 / 154 / 152 tok/s |
+| Time to first token with 2 / 4 / 8 in flight (p50) | 2.3 s / 12.1 s / 32.7 s | 0.37 s / 0.42 s / 8.4 s |
+| Peak VRAM over the run | 31,044 MiB at 98,304 tokens | 32,266 MiB at 245,760 tokens |
+
+A lone stream decodes 4% slower, the cost of the 8-bit cache; everything else is ahead: the first token three times
+sooner, prompts read 5–10% faster, 2.5× the context, and with several requests in flight 1.7× the throughput while the
+fourth request starts in 0.4 s instead of 12 s. The 245,760-token pool peaks at ~32.3 GB of the card's 32.5 over a long
+run of mixed traffic.
 
 ## Build
 
@@ -95,38 +117,40 @@ repository.
 
 ## Run
 
-One card, two slots, DFlash2, one 245,760-token pool:
+One card, four slots, DFlash2, one 245,760-token pool:
 
 ```bash
-LLAMA_DFLASH2_HEAD_FILE=models/mtp-Qwen3.8-27B-Q4_0.gguf LLAMA_SPEC_DRAFT_VOCAB_FILE=models/draft-vocab-qwen3.8-27b.txt build/bin/llama-server -m models/Qwen3.8-27B-UD-Q4_K_XL.gguf -md models/Qwen3.8-27B-DFlash2-Q4_K_M.gguf --spec-type draft-dflash --spec-draft-n-max 7 --spec-draft-ubatch 512 -c 245760 --parallel 2 --kv-unified -fa on -ngl 99 -ctk q8_0 -ctv q8_0 -ctkd f16 -ctvd f16 -t 12 -b 2048 -ub 2048 --cache-ram 0 --jinja --metrics --temp 1.0 --top-p 0.95 --top-k 20 --host 127.0.0.1 --port 8080
+LLAMA_RS_POOL=12 LLAMA_DFLASH2_HEAD_FILE=models/mtp-Qwen3.8-27B-Q4_0.gguf LLAMA_SPEC_DRAFT_VOCAB_FILE=models/draft-vocab-qwen3.8-27b.txt build/bin/llama-server -m models/Qwen3.8-27B-UD-Q4_K_XL.gguf -md models/Qwen3.8-27B-DFlash2-Q4_K_M.gguf --spec-type draft-dflash --spec-draft-n-max 7 --spec-draft-ubatch 512 -c 245760 --parallel 4 --kv-unified -fa on -ngl 99 -ctk q8_0 -ctv q8_0 -ctkd f16 -ctvd f16 -t 12 -b 2048 -ub 2048 --cache-ram 0 --jinja --metrics --temp 1.0 --top-p 0.95 --top-k 20 --host 127.0.0.1 --port 8080
 ```
 
 The same with the Docker image (models in `$PWD/models`):
 
 ```bash
-docker run -d --name llama-superfast --init --gpus all -p 8080:8080 -v "$PWD/models:/models:ro" -e LLAMA_DFLASH2_HEAD_FILE=/models/mtp-Qwen3.8-27B-Q4_0.gguf llama-superfast-v100 --host 0.0.0.0 --port 8080 -m /models/Qwen3.8-27B-UD-Q4_K_XL.gguf -md /models/Qwen3.8-27B-DFlash2-Q4_K_M.gguf --spec-type draft-dflash --spec-draft-n-max 7 --spec-draft-ubatch 512 -c 245760 --parallel 2 --kv-unified -fa on -ngl 99 -ctk q8_0 -ctv q8_0 -ctkd f16 -ctvd f16 -t 12 -b 2048 -ub 2048 --cache-ram 0 --jinja --metrics --temp 1.0 --top-p 0.95 --top-k 20
+docker run -d --name llama-superfast --init --gpus all -p 8080:8080 -v "$PWD/models:/models:ro" -e LLAMA_RS_POOL=12 -e LLAMA_DFLASH2_HEAD_FILE=/models/mtp-Qwen3.8-27B-Q4_0.gguf llama-superfast-v100 --host 0.0.0.0 --port 8080 -m /models/Qwen3.8-27B-UD-Q4_K_XL.gguf -md /models/Qwen3.8-27B-DFlash2-Q4_K_M.gguf --spec-type draft-dflash --spec-draft-n-max 7 --spec-draft-ubatch 512 -c 245760 --parallel 4 --kv-unified -fa on -ngl 99 -ctk q8_0 -ctv q8_0 -ctkd f16 -ctvd f16 -t 12 -b 2048 -ub 2048 --cache-ram 0 --jinja --metrics --temp 1.0 --top-p 0.95 --top-k 20
 ```
 
 What the settings do:
 
-- The two-user scheduler is on (section 8): a long prompt in one slot no longer stalls the other slot's decode.
+- The two-user scheduler is on (section 8): a long prompt in one slot no longer stalls the other slots' decode.
   `LLAMA_TU=0` turns it off.
+- `--parallel 4` with `LLAMA_RS_POOL=12` (sections 12 and 13): four slots in the recurrent memory of two. With
+  `--parallel 2`, leave `LLAMA_RS_POOL` unset; two slots take the same memory either way.
 - `LLAMA_DFLASH2_HEAD_FILE` points DFlash2's output head at the MTP file's rows.
 - `LLAMA_SPEC_DRAFT_VOCAB_FILE` (set by the Docker image) restricts the draft to the top 98,304 ids of the file's
   131,072-id ranking. Without it, decode is ~5–10% slower.
-- `--kv-unified` gives both slots one 245,760-token pool: either slot can take most of it (one took a 157k-token prompt
-  while the other answered side requests). `--kv-unified-per-slot N` caps each slot inside the pool;
-  `--no-kv-unified` gives each slot a fixed half (2 × 122,880) at the same speed.
+- `--kv-unified` gives the slots one 245,760-token pool: any slot can take most of it (one took a 157k-token prompt
+  while another answered side requests). `--kv-unified-per-slot N` caps each slot inside the pool;
+  `--no-kv-unified` gives each slot a fixed share (with two slots 2 × 122,880) at the same speed.
 - `-b 2048` equal to `-ub` keeps the DFlash2 features on the GPU during prefill (section 3).
 - `--spec-draft-ubatch 512` sizes the draft's compute buffer for 512-token batches, which frees 1.7 GB.
 - `--cache-ram 0` turns off the host prompt cache. Saving a slot's state to host memory costs ~220 ms over a slow link
   each time a slot switches conversations; with one user and pinned slots (`id_slot` in the request) the cache brings
   little. On a fast link, try it on.
-- 245,760 tokens peaks at ~32.1 GB. VRAM keeps growing for the first minutes of real traffic, so size a different
-  context from a long mixed run, not a fill test (section 5).
+- 245,760 tokens with four slots peaks at ~32.3 GB. VRAM keeps growing for the first minutes of real traffic, so size a
+  different context from a long mixed run, not a fill test (section 5).
 
 Check the startup log for `two-user scheduling (LLAMA_TU): on`, the draft model loading, and
-`n_slots = 2, n_ctx_slot = 245760`. Draft acceptance on this target is ~0.5; near zero means the draft did not load.
+`n_slots = 4, n_ctx_slot = 245760`. Draft acceptance on this target is ~0.5; near zero means the draft did not load.
 
 For MTP instead of DFlash2: `-md models/mtp-Qwen3.8-27B-Q4_0.gguf --spec-type draft-mtp`, without
 `LLAMA_DFLASH2_HEAD_FILE` or `--spec-draft-ubatch`. It decodes slower here.
@@ -219,7 +243,8 @@ other slot or by its own earlier prompts, and every later window spanned them.
   small holes beside the other slot's conversation.
 - Known trade-off: a new conversation placed right after the other slot's cells can block that slot's next prompt
   chunk, which then jumps past it and slows its long-prompt prefill. Placing new conversations in the middle of the
-  free run avoids that but slows two-slot decode, so the current build keeps the tight placement.
+  free run avoids that but slows two-slot decode, so the current build keeps the tight placement; section 14 moves or
+  clears what blocks a prompt's start.
 - Switches: `LLAMA_KV_PLACE_MIN_TOKENS` (default 1) sets the smallest ubatch placed this way; `LLAMA_KV_WINDOW_LOG=1`
   logs placements and windows.
 
@@ -273,12 +298,66 @@ its prompt went past that conversation and every window spanned it. Before a uba
 place, up to 1,024 of its own cells move next to the free run its ubatch will use (`LLAMA_KV_COMPACT_MAX`): a 15.6k-token
 prompt beside a 37k-token resident conversation, 708 -> 933 tok/s.
 
+### 12. Four slots: the verify rows budgeted, the draft one width at a time (`100cd2c`)
+
+A verify step of the 27B costs ~40 ms whatever its width up to 8 rows, +15% to 16 rows and +35% to 32 (the tensor-core
+matvec's 32-token kernel runs one block per SM). Three slots at the draft's 7 tokens made 24 rows a step, and a third
+slot added nothing (93 vs 93 tok/s combined).
+
+- The generating slots share a budget of verify rows, 8 up to two slots and 16 from three (`LLAMA_SPEC_WIDTH_SLOTS=8,16`):
+  each drafts `budget / generating − 1` tokens, so two slots keep 7, three draft 4 and four draft 3.
+- The DFlash2 draft graph needs equal block widths in one ubatch, so the draft now runs one width at a time when slots
+  draft different widths. Before, a narrowed slot beside full ones mis-blocked silently at two slots and asserted at
+  three.
+
+### 13. A shared pool of rollback snapshots (`36bd290`, `f8aaffa`)
+
+Each slot kept its own rollback snapshots of the recurrent state, as many rows as the draft's tokens: 150 MiB a row,
+1.2 GB a slot at 7, so four slots at full depth would have cost 2.4 GB more (~70k tokens of context), and four slots at
+a depth of 3 made a lone slot draft 3 as well (decode 74–82 tok/s instead of 90–116).
+
+- `LLAMA_RS_POOL=12` makes the rollback rows one pool the slots share: a slot alone takes 7, two take 6 each, three 4
+  and four 3. The runs are planned when the set of active slots changes, and a snapshot still to be read is applied to
+  the live row before its run moves. Four live rows and 12 shared ones are 2.4 GB, the same as two slots before, so
+  four slots fit the 245,760-token pool.
+- The graph writes each sequence's snapshots as a copy of its own (the fused GDN cache write takes per-sequence bases),
+  and the snapshot rows belong to the sequence, not to the storage cell: `f8aaffa` fixed a lookup through the cell,
+  which read another sequence's snapshot once the cache had moved a sequence's state (three pinned slots generating
+  together: one answer ended after 4 tokens; a released slot's cell tripped an assert in BetterBench's concurrency
+  sweep).
+- Greedy outputs of a lone slot are identical with the pool on and off (600 tokens, the same draft counts).
+- Switches: `LLAMA_RS_POOL=N` (default 0: the per-slot layout), `LLAMA_RS_POOL_LOG=1`, `LLAMA_GDN_CACHE_FUSE=0` (the
+  unfused writes, ~10% slower with several slots).
+
+### 14. A prompt's cells stay one run, low in the pool (`39dfacc`, `5e4a216`)
+
+With four slots, a prompt's cached prefix (a shared system prompt, or the longest common prefix of an earlier prompt in
+that slot) sat in cells far from the free run its body took, and every ubatch of the prompt read the window spanning
+both: a 6k-token prompt read 50k cells, and cold 47k-token prompts fell from 716 to 491 tok/s. The per-ubatch compaction
+of section 11 skipped those prefixes (its 1,024-cell cap).
+
+- At a prompt's start the server asks the cache how many tokens the sequence can add while staying one run: the free
+  cells after its last cell, or the largest free run when it has none.
+- When the prompt does not fit, its whole cached prefix moves to the start of the largest free run that holds it and
+  the prompt (a copy of a few ms, once per prompt; `LLAMA_KV_COMPACT_PROMPT_MAX` caps the cells moved).
+- If it still does not fit, the idle slots' conversations are cleared, the least recently used first and only those
+  shorter than this prompt, so a long resident conversation is never dropped for a shorter prompt
+  (`LLAMA_KV_EVICT_IDLE=0` keeps them all; with `--cache-ram` they are saved to the prompt cache first).
+- A new conversation takes the lowest free run that holds its whole prompt with room to grow
+  (`LLAMA_KV_PLACE_MARGIN` cells, default 16,384), the largest run only when none does. The largest run alone sent new
+  conversations to the top of an emptying pool, and the slots' decodes then read the whole used range: after four
+  47k-token prompts, four short conversations decoded at 95 tok/s combined instead of 131.
+- BetterBench's prefill sweep on four slots: 12k / 24k / 47k tokens 961 / 915 / 830 tok/s, against 920 / 836 / 716 on
+  two slots before; its concurrency sweep 154 tok/s with four requests in flight and 152 with eight.
+
 ## Known limits
 
 - Tested only on V100 PCIe 32 GB with Qwen3.8-27B. The window and placement changes are on for the qwen35 model line
   only.
-- Two slots cap combined throughput near the two-slot decode rate (~120 tok/s); a third slot costs ~1 GB of VRAM (its
-  recurrent state and rollback snapshots), about 30k tokens of context.
+- Combined decode tops out near 130–160 tok/s with four slots: a verify step costs about the same up to 8 rows, so the
+  slots share 16 verify rows a step (section 12), and each slot drafts less when more generate.
+- Four slots at 245,760 tokens use ~32.3 GB of the card's 32.5: no room for a fifth slot or a larger pool. The
+  recurrent rows alone are 150 MiB each (section 13).
 - The first two prompts after a start pay ~0.4 s once each to allocate a device checkpoint copy.
 
 ## Credits and license
