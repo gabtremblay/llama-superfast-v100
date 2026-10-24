@@ -109,6 +109,7 @@ rebuilding after a small change takes a few minutes.
 ```bash
 hf download unsloth/Qwen3.8-27B-GGUF Qwen3.8-27B-UD-Q4_K_XL.gguf MTP/mtp-Qwen3.8-27B-Q4_0.gguf --local-dir models
 hf download z-lab/Qwen3.8-27B-DFlash2-GGUF Qwen3.8-27B-DFlash2-Q4_K_M.gguf --local-dir models
+hf download unsloth/Qwen3.8-27B-GGUF mmproj-F16.gguf --local-dir models   # for images (the Vision section)
 ```
 
 Put the files flat in `./models` (move `MTP/mtp-Qwen3.8-27B-Q4_0.gguf` up). DFlash2 needs the MTP file too: its output
@@ -154,6 +155,35 @@ Check the startup log for `two-user scheduling (LLAMA_TU): on`, the draft model 
 
 For MTP instead of DFlash2: `-md models/mtp-Qwen3.8-27B-Q4_0.gguf --spec-type draft-mtp`, without
 `LLAMA_DFLASH2_HEAD_FILE` or `--spec-draft-ubatch`. It decodes slower here.
+
+## Vision
+
+The server takes images when Qwen3.8-27B's vision projector is loaded: `--mmproj models/mmproj-F16.gguf`
+(from the same Unsloth repository, 884 MiB; a BF16 one is there too, and any Qwen3.8-27B projector fits, a Q8_0 one
+saving ~440 MiB). Chat requests then carry `image_url` parts (data: URLs or http). The projector and its encode buffers
+need room the 245,760-token pool does not have, so the pool gives up 49,152 tokens:
+
+```bash
+LLAMA_RS_POOL=12 LLAMA_DFLASH2_HEAD_FILE=models/mtp-Qwen3.8-27B-Q4_0.gguf LLAMA_SPEC_DRAFT_VOCAB_FILE=models/draft-vocab-qwen3.8-27b.txt build/bin/llama-server -m models/Qwen3.8-27B-UD-Q4_K_XL.gguf --mmproj models/mmproj-F16.gguf -md models/Qwen3.8-27B-DFlash2-Q4_K_M.gguf --spec-type draft-dflash --spec-draft-n-max 7 --spec-draft-ubatch 512 -c 196608 --parallel 4 --kv-unified -fa on -ngl 99 -ctk q8_0 -ctv q8_0 -ctkd f16 -ctvd f16 -t 12 -b 2048 -ub 2048 --cache-ram 0 --jinja --metrics --temp 1.0 --top-p 0.95 --top-k 20 --host 127.0.0.1 --port 8080
+```
+
+(the Docker line takes the same two additions: `--mmproj /models/mmproj-F16.gguf` and `-c 196608`).
+
+What was measured (four slots, `LLAMA_RS_POOL=12`, `--cache-ram 0`):
+
+- 196,608 tokens is the largest pool that keeps a margin: 29.6 GB after load, 31.6 GB peak over 50 minutes of concurrent
+  image and text requests, 47k-token prompts and four-slot decode, against the card's 32.5 GB; the text-only pool of
+  245,760 already peaks at 32.3 GB, and 212,992 with the projector would leave ~0.6 GB, less than the first minutes'
+  growth (section 5).
+- A 2048 × 1536 image is ~3,100 prompt tokens, read at ~520 tok/s; an 800 × 600 one ~500 tokens. Its answer decodes at
+  85–108 tok/s with the draft (a red square, a blue circle and a white band in a test image are all named).
+- Text requests are unchanged: four in flight 130–134 tok/s combined, 47k-token prompts at 843 tok/s. The two-user
+  scheduler stays on with a projector loaded (`TAG_TU_MTMD`): a text prompt is read as a job beside the other slots'
+  decodes as before, and only a prompt that holds media is read in the batch, so a decoding slot pauses for the ~6 s a
+  large image takes. Without that change the scheduler went off as soon as `--mmproj` was given, and four text
+  requests in flight fell to 71 tok/s combined.
+- With a projector loaded, llama.cpp's prompt cache reuse and context shift are off for every slot (upstream's rule), and
+  so is the fork's tail-snapshot checkpoint for prompts that hold media.
 
 ## What changed
 
