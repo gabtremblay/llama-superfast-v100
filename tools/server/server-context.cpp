@@ -1891,7 +1891,10 @@ private:
             ckpt_dev.n = std::max(0, env_int("LLAMA_CKPT_DEV", 2));
 
             const bool can_run = llama_decode_job_supported(ctx_tgt);
-            tu_capable = can_run && params_base.n_parallel > 1 && mctx == nullptr;
+            // [TAG_TU_MTMD] a loaded projector no longer turns the scheduler off: prompts with media stay out of its jobs
+            // (tu_eligible), text prompts read as jobs beside the other slots' decodes as without one. With the scheduler
+            // off, four slots of text requests fell to 71 tok/s combined (131 with it) as soon as --mmproj was given
+            tu_capable = can_run && params_base.n_parallel > 1;
             tu_engaged = tu_policy.on && tu_capable;
 
             LOG_WRN("two-user scheduling (LLAMA_TU): %s, slice %d ms, group %d layers, force %d, diag %d, one sync a slice %d, forced slice groups %d\n",
@@ -1907,7 +1910,7 @@ private:
             }
             if (tu_policy.on && !tu_engaged) {
                 LOG_WRN("two-user scheduling (LLAMA_TU): not engaged: %s\n",
-                        params_base.n_parallel <= 1 ? "one slot" : mctx != nullptr ? "multimodal" :
+                        params_base.n_parallel <= 1 ? "one slot" :
                         "the model has no layer groups or the context cannot run jobs (one sequence; a unified KV cache with "
                         "-b > -ub; a draft's layer inputs off the device path or with -b > its rows)");
             }
@@ -4756,8 +4759,9 @@ private:
 
     // the slot's task can be a job: a completion, no embeddings, no LoRA, no parent or child
     bool tu_eligible(const server_slot & slot) const {
+        // [TAG_TU_MTMD] a prompt with media (an image's embeddings go in as a chunk of their own) is read in the batch
         return slot.task && slot.task->type == SERVER_TASK_TYPE_COMPLETION && !slot.need_embd() && slot.lora.empty() &&
-            !slot.task->is_parent() && !slot.task->is_child();
+            !slot.task->is_parent() && !slot.task->is_child() && !slot.task->tokens.has_media();
     }
 
     // prompt tokens the reader has left to read: not yet filled, plus the job's not yet completed. A
