@@ -2735,6 +2735,38 @@ bool llama_context::job_supported() const {
     return true;
 }
 
+bool llama_context::kv_compact_seq(llama_seq_id seq_id, uint32_t n_next) {
+    if (!cparams.kv_unified || n_next == 0) {
+        return false;
+    }
+    llama_kv_cache * kv = nullptr;
+    if (auto * h = dynamic_cast<llama_memory_hybrid *>(memory.get())) {
+        kv = h->get_mem_attn();
+    } else {
+        kv = dynamic_cast<llama_kv_cache *>(memory.get());
+    }
+    // the whole cached prefix may move (LLAMA_KV_COMPACT_PROMPT_MAX cells, default the cache size): a few ms once per prompt
+    static const uint32_t max_cells = [] {
+        const char * e = getenv("LLAMA_KV_COMPACT_PROMPT_MAX");
+        return e ? (uint32_t) std::max(0, atoi(e)) : UINT32_MAX;
+    }();
+    return kv != nullptr && max_cells > 0 && kv->seq_compact(seq_id, n_next, [this] { synchronize(); }, max_cells);
+}
+
+// [TAG_KV_EVICT_IDLE]
+uint32_t llama_context::kv_room(llama_seq_id seq_id) const {
+    if (!cparams.kv_unified) {
+        return UINT32_MAX;
+    }
+    const llama_kv_cache * kv = nullptr;
+    if (auto * h = dynamic_cast<llama_memory_hybrid *>(memory.get())) {
+        kv = h->get_mem_attn();
+    } else {
+        kv = dynamic_cast<llama_kv_cache *>(memory.get());
+    }
+    return kv != nullptr ? kv->seq_room(seq_id) : UINT32_MAX;
+}
+
 // [TAG_KV_COMPACT] llama_kv_cache::seq_compact for a batch of one sequence in a unified cache
 void llama_context::kv_compact(const llama_batch & b) {
     if (!cparams.kv_unified || b.n_tokens <= 0) {
@@ -6227,6 +6259,15 @@ uint32_t llama_rs_set_depth(llama_context * ctx, llama_seq_id seq_id, uint32_t d
     // a pending rollback snapshot may move with its sequence's run: the device must be done with the last decode's writes
     llama_synchronize(ctx);
     return r->set_rs_depth(seq_id, depth);
+}
+
+// [TAG_KV_EVICT_IDLE]
+uint32_t llama_kv_room(llama_context * ctx, llama_seq_id seq_id) {
+    return ctx->kv_room(seq_id);
+}
+
+bool llama_kv_compact_seq(llama_context * ctx, llama_seq_id seq_id, uint32_t n_next) {
+    return ctx->kv_compact_seq(seq_id, n_next);
 }
 
 void llama_rs_set_depths(llama_context * ctx, const uint32_t * depths, size_t n) {

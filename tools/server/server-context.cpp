@@ -5891,6 +5891,50 @@ private:
 
                     slot.mem.seq_rm(slot.id, p0, -1);
 
+                    // [TAG_KV_EVICT_IDLE] in a unified cache a prompt keeps its window tight only while its cells stay one run: the
+                    // cells after the slot's last must be free, or a free run must hold the whole prompt when the slot starts empty.
+                    // Else, first the slot's cached prefix (a shared system prompt, at most LLAMA_KV_COMPACT_MAX cells) moves to the
+                    // start of the largest free run that holds it and the prompt; then the idle slots' conversations, the least
+                    // recently used first and only those shorter than this prompt, are cleared (saved to the prompt cache when
+                    // there is one) until it fits; a longer idle conversation is kept, its prefill costs more than this one's
+                    // window. LLAMA_KV_EVICT_IDLE=0 turns the clearing off
+                    static const bool kv_evict_idle = [] { const char * e = getenv("LLAMA_KV_EVICT_IDLE"); return e ? atoi(e) != 0 : true; }();
+                    if (params_base.kv_unified) {
+                        const int32_t n_add = slot.task->n_tokens() - slot.prompt.n_tokens();
+                        uint32_t room = llama_kv_room(ctx_tgt, slot.id);
+                        if (n_add > 0 && (uint64_t) n_add > room && llama_kv_compact_seq(ctx_tgt, slot.id, (uint32_t) n_add)) {
+                            room = llama_kv_room(ctx_tgt, slot.id);
+                            LOG_WRN("[scheduler] kv_compact_prefix: t_us=%" PRId64 " slot=%d cached=%d n_add=%d room=%u\n",
+                                    ggml_time_us(), slot.id, slot.prompt.n_tokens(), n_add, room);
+                        }
+                        if (kv_evict_idle && n_add > 0 && (uint64_t) n_add > room) {
+                            std::vector<server_slot *> idle;
+                            for (auto & s : slots) {
+                                if (&s != &slot && !s.is_processing() && !s.tu_owned && !s.prompt.tokens.empty() &&
+                                        (int32_t) s.prompt.tokens.size() < slot.task->n_tokens()) {
+                                    idle.push_back(&s);
+                                }
+                            }
+                            std::sort(idle.begin(), idle.end(), [](const server_slot * a, const server_slot * b) { return a->t_last_used < b->t_last_used; });
+                            for (server_slot * s : idle) {
+                                if ((uint64_t) n_add <= room) {
+                                    break;
+                                }
+                                const size_t n_was = s->prompt.tokens.size();
+                                if (prompt_cache && s->prompt_save(*prompt_cache)) {
+                                    prompt_cache->update();
+                                }
+                                s->prompt_clear();
+                                room = llama_kv_room(ctx_tgt, slot.id);
+                                if ((uint64_t) n_add > room && llama_kv_compact_seq(ctx_tgt, slot.id, (uint32_t) n_add)) {
+                                    room = llama_kv_room(ctx_tgt, slot.id);
+                                }
+                                LOG_WRN("[scheduler] kv_evict_idle: t_us=%" PRId64 " slot=%d cleared=%zu for_slot=%d n_add=%d room=%u\n",
+                                        ggml_time_us(), s->id, n_was, slot.id, n_add, room);
+                            }
+                        }
+                    }
+
                     // If using an alora, there may be uncached tokens that come
                     // before the invocation sequence. When this happens, the
                     // tokens before the invocation sequence need to be

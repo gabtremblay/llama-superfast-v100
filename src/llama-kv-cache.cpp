@@ -1468,14 +1468,49 @@ const llama_kv_cells & llama_kv_cache::get_cells(llama_seq_id seq_id) const {
     return v_cells[seq_to_stream[seq_id]];
 }
 
+// [TAG_KV_EVICT_IDLE]
+uint32_t llama_kv_cache::seq_room(llama_seq_id seq_id) const {
+    if (!kv_window || n_stream != 1 || seq_id < 0) {
+        return v_cells[0].size();
+    }
+    const auto & cells = v_cells[0];
+    int64_t last = -1;
+    for (uint32_t j = cells.used_max_p1(); j-- > 0; ) {
+        if (!cells.is_empty(j) && cells.seq_has(j, seq_id)) {
+            last = j;
+            break;
+        }
+    }
+    uint32_t room = 0;
+    if (last >= 0) {
+        for (uint32_t j = (uint32_t) last + 1; j < cells.size() && cells.is_empty(j); ++j) {
+            ++room;
+        }
+        return room;
+    }
+    uint32_t run = 0;
+    for (uint32_t j = 0; j <= cells.size(); ++j) {
+        if (j < cells.size() && cells.is_empty(j)) {
+            ++run;
+            continue;
+        }
+        room = std::max(room, run);
+        run  = 0;
+    }
+    return room;
+}
+
 // [TAG_KV_COMPACT] a new conversation in a unified cache keeps the cells of the prefix it restored (a shared system prompt), which sat
 // before the other slot's conversation: with no room after them, its prompt went past the other conversation, and every window of it
 // spanned that conversation's cells, masked but read (a 47k-token prompt beside a 47k-token resident conversation)
-bool llama_kv_cache::seq_compact(llama_seq_id seq_id, uint32_t n_next, const std::function<void()> & sync) {
-    static const uint32_t max_cells = [] {
+bool llama_kv_cache::seq_compact(llama_seq_id seq_id, uint32_t n_next, const std::function<void()> & sync, uint32_t max_cells) {
+    static const uint32_t max_cells_env = [] {
         const char * e = getenv("LLAMA_KV_COMPACT_MAX");
         return e ? (uint32_t) std::max(0, atoi(e)) : 1024u;
     }();
+    if (max_cells == 0) {
+        max_cells = max_cells_env;
+    }
     if (!kv_window || max_cells == 0 || n_stream != 1 || v_trans || seq_id < 0 || n_next == 0) {
         return false;
     }

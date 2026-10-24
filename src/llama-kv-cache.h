@@ -183,7 +183,12 @@ public:
     // last are taken) and it holds at most LLAMA_KV_COMPACT_MAX cells (default 1024; 0: off) of its own, they move to the start of
     // the largest free run that holds them and the ubatch, so find_slot places the ubatch right after them and the sequence's
     // window does not span the cells between. Returns true if it moved them
-    bool seq_compact(llama_seq_id seq_id, uint32_t n_next, const std::function<void()> & sync);
+    // max_cells overrides LLAMA_KV_COMPACT_MAX for this call (a prompt's start moves its whole cached prefix: a copy of a few ms once)
+    bool seq_compact(llama_seq_id seq_id, uint32_t n_next, const std::function<void()> & sync, uint32_t max_cells = 0);
+
+    // [TAG_KV_EVICT_IDLE] the cells a sequence can take while staying one run: the free cells right after its last cell, or
+    // the largest free run when it has none (the placement of find_slot). The cache size when the window placement is off
+    uint32_t seq_room(llama_seq_id seq_id) const;
 
     // turn on the change journal of every cells array (llama_kv_cells::jrnl_enable)
     void cells_jrnl_enable();

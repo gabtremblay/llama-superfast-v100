@@ -276,6 +276,8 @@ private:
     //
 
 public:
+    uint32_t kv_room(llama_seq_id seq_id) const; // [TAG_KV_EVICT_IDLE]
+    bool     kv_compact_seq(llama_seq_id seq_id, uint32_t n_next); // [TAG_KV_COMPACT] for the whole rest of a prompt
     uint32_t graph_max_nodes(uint32_t n_tokens) const;
 
     // can reuse the llm_graph_result instance of the context (for example to update a memory module)
